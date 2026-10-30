@@ -77,6 +77,15 @@ read legacy binary `.doc` files.
 
 Commercial capabilities are available at https://wolfdocx.com.
 
+## Related libraries
+
+The same MIT-licensed family covers the other Office formats:
+
+- [WolfXL](https://github.com/SynthGL/wolfxl-oss): read, write, and edit Excel
+  `.xlsx` and `.xlsm` workbooks, an openpyxl alternative (`pip install wolfxl`).
+- [WolfPPT](https://github.com/wolfiesch/wolfppt-oss): edit PowerPoint `.pptx`
+  decks, a python-pptx alternative (`pip install wolfppt`).
+
 ## Contributing
 
 ```bash
