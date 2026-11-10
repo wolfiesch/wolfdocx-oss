@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wolfdocx"
-version = "0.1.0"
-description = "Read, write, and edit Word .docx files in Python. A python-docx alternative that edits documents in place and keeps every untouched part byte-for-byte identical. Pure Python, MIT licensed."
+version = "0.1.1"
+description = "Read and edit existing Word .docx files in Python. A python-docx alternative that edits documents in place and keeps every untouched part byte-for-byte identical. Pure Python, MIT licensed."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -18,7 +18,6 @@ keywords = [
     "python-docx",
     "python-docx-alternative",
     "edit-docx",
-    "create-docx",
     "openxml",
     "office",
     "office-automation",

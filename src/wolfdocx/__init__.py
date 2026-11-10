@@ -6,7 +6,7 @@ from .package import PackageError, PackageGraph, PackageLimits
 from .session_ops import SessionEditReport
 from .session_ops.rich_objects import SessionSaveReport
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Document",
