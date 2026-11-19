@@ -23,8 +23,8 @@ from xml.etree import ElementTree as ET
 
 from .authoring import _unsupported_context_by_element
 from .inspect import (
-    Q,
     STRICT_WORD_NS,
+    Q,
     parse_xml_with_preserved_qnames,
     serialize_xml_with_preserved_qnames,
 )
@@ -45,9 +45,7 @@ _STYLES_PART = "word/styles.xml"
 _NUMBERING_REL_TYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering"
 )
-_STRICT_NUMBERING_REL_TYPE = (
-    "http://purl.oclc.org/ooxml/officeDocument/relationships/numbering"
-)
+_STRICT_NUMBERING_REL_TYPE = "http://purl.oclc.org/ooxml/officeDocument/relationships/numbering"
 _NUMBERING_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
 )
@@ -143,10 +141,7 @@ class NumberingEdit:
         if (
             not isinstance(self.structure_fingerprint_sha256, str)
             or len(self.structure_fingerprint_sha256) != 64
-            or any(
-                c not in "0123456789abcdefABCDEF"
-                for c in self.structure_fingerprint_sha256
-            )
+            or any(c not in "0123456789abcdefABCDEF" for c in self.structure_fingerprint_sha256)
         ):
             raise ValueError("numbering_fingerprint_invalid")
         if not isinstance(self.part, str) or self.part != _DOCUMENT:
@@ -339,9 +334,7 @@ def _parse_edit(value: Any) -> NumberingEdit:
 
     start_override: int | None = None
     if "start_override" in value:
-        start_override = _positive(
-            value["start_override"], "numbering_start_override", zero=True
-        )
+        start_override = _positive(value["start_override"], "numbering_start_override", zero=True)
 
     restart_group: str | None = None
     if "restart_group" in value:
@@ -404,9 +397,7 @@ def load_numbering_request(path: str | Path) -> NumberingRequest:
         return parse_numbering_request(json.load(stream))
 
 
-def _unrelated_parts_preserved(
-    source: Path, candidate: Path, changed: frozenset[str]
-) -> bool:
+def _unrelated_parts_preserved(source: Path, candidate: Path, changed: frozenset[str]) -> bool:
     """True when every part the request did not change is byte-identical to source."""
     with (
         zipfile.ZipFile(source) as before,
@@ -414,16 +405,13 @@ def _unrelated_parts_preserved(
     ):
         names = set(after.namelist())
         return all(
-            info.filename in names
-            and before.read(info.filename) == after.read(info.filename)
+            info.filename in names and before.read(info.filename) == after.read(info.filename)
             for info in before.infolist()
             if info.filename not in changed
         )
 
 
-def _has_unsupported_context(
-    root: ET.Element, paragraph: ET.Element, namespace: str
-) -> bool:
+def _has_unsupported_context(root: ET.Element, paragraph: ET.Element, namespace: str) -> bool:
     unsupported_map = _unsupported_context_by_element(root, namespace)
     if unsupported_map.get(id(paragraph), False):
         return True
@@ -484,9 +472,7 @@ def _insert_num_in_schema_order(
         numbering_root.append(num_elem)
 
 
-def _insert_num_pr_in_schema_order(
-    p_pr: ET.Element, namespace: str, num_pr: ET.Element
-) -> None:
+def _insert_num_pr_in_schema_order(p_pr: ET.Element, namespace: str, num_pr: ET.Element) -> None:
     """Insert a w:numPr element into w:pPr maintaining schema order."""
     succeeding_qnames = {Q(namespace, tag) for tag in _PPR_SUCCEEDING_TAGS}
     for idx, child in enumerate(p_pr):
@@ -548,9 +534,7 @@ def _resolved_paragraph_style_numbering(
         stype = style_elem.get(Q(namespace, "type")) or style_elem.get("type")
         if stype == "paragraph" and sid:
             styles_by_id[sid] = style_elem
-            is_default = style_elem.get(Q(namespace, "default")) or style_elem.get(
-                "default"
-            )
+            is_default = style_elem.get(Q(namespace, "default")) or style_elem.get("default")
             if is_default in ("1", "true"):
                 default_style_id = sid
 
@@ -558,9 +542,7 @@ def _resolved_paragraph_style_numbering(
     if not target_style:
         doc_defaults = styles_root.find(Q(namespace, "docDefaults"))
         if doc_defaults is not None:
-            dd_p_pr = doc_defaults.find(
-                f"{Q(namespace, 'pPrDefault')}/{Q(namespace, 'pPr')}"
-            )
+            dd_p_pr = doc_defaults.find(f"{Q(namespace, 'pPrDefault')}/{Q(namespace, 'pPr')}")
             if dd_p_pr is not None:
                 dd_num_pr = dd_p_pr.find(Q(namespace, "numPr"))
                 if dd_num_pr is not None:
@@ -593,11 +575,7 @@ def _resolved_paragraph_style_numbering(
             num_pr = s_p_pr.find(Q(namespace, "numPr"))
             if num_pr is not None:
                 nid = num_pr.find(Q(namespace, "numId"))
-                val = (
-                    (nid.get(Q(namespace, "val")) or nid.get("val"))
-                    if nid is not None
-                    else None
-                )
+                val = (nid.get(Q(namespace, "val")) or nid.get("val")) if nid is not None else None
                 if val and val.isdigit():
                     nid_int = int(val)
                     if nid_int == 0:
@@ -619,18 +597,12 @@ def _resolved_paragraph_style_numbering(
 
     doc_defaults = styles_root.find(Q(namespace, "docDefaults"))
     if doc_defaults is not None:
-        dd_p_pr = doc_defaults.find(
-            f"{Q(namespace, 'pPrDefault')}/{Q(namespace, 'pPr')}"
-        )
+        dd_p_pr = doc_defaults.find(f"{Q(namespace, 'pPrDefault')}/{Q(namespace, 'pPr')}")
         if dd_p_pr is not None:
             dd_num_pr = dd_p_pr.find(Q(namespace, "numPr"))
             if dd_num_pr is not None:
                 nid = dd_num_pr.find(Q(namespace, "numId"))
-                val = (
-                    (nid.get(Q(namespace, "val")) or nid.get("val"))
-                    if nid is not None
-                    else None
-                )
+                val = (nid.get(Q(namespace, "val")) or nid.get("val")) if nid is not None else None
                 if val and val.isdigit():
                     nid_int = int(val)
                     if nid_int > 0:
@@ -707,9 +679,7 @@ def _ensure_numbering_registration(
     namespace: str,
 ) -> None:
     relationship_type = (
-        _STRICT_NUMBERING_REL_TYPE
-        if namespace == STRICT_WORD_NS
-        else _NUMBERING_REL_TYPE
+        _STRICT_NUMBERING_REL_TYPE if namespace == STRICT_WORD_NS else _NUMBERING_REL_TYPE
     )
     ct_data = replacements.get("[Content_Types].xml", parts.get("[Content_Types].xml"))
     if ct_data is not None:
@@ -739,13 +709,9 @@ def _ensure_numbering_registration(
             for rel in rels_root.findall(Q(_PR, "Relationship"))
         )
         if not has_rel:
-            existing_ids = [
-                rel.get("Id", "") for rel in rels_root.findall(Q(_PR, "Relationship"))
-            ]
+            existing_ids = [rel.get("Id", "") for rel in rels_root.findall(Q(_PR, "Relationship"))]
             rid_nums = [
-                int(rid[3:])
-                for rid in existing_ids
-                if rid.startswith("rId") and rid[3:].isdigit()
+                int(rid[3:]) for rid in existing_ids if rid.startswith("rId") and rid[3:].isdigit()
             ]
             next_rid = f"rId{(max(rid_nums) if rid_nums else 0) + 1}"
             rels_root.append(
@@ -761,9 +727,7 @@ def _ensure_numbering_registration(
             replacements[rels_name] = serialize_xml_with_preserved_qnames(rels_root)
 
 
-def discover_numbering_targets(
-    source: str | Path, *, part: str = _DOCUMENT
-) -> dict[str, Any]:
+def discover_numbering_targets(source: str | Path, *, part: str = _DOCUMENT) -> dict[str, Any]:
     """List source-bound paragraph targets, existing abstract definitions, and instances."""
     path = Path(source)
     try:
@@ -865,20 +829,12 @@ def discover_numbering_targets(
                     ilvl = int(ilvl_str)
                     fmt_elem = lvl.find(Q(namespace, "numFmt"))
                     num_fmt = (
-                        fmt_elem.get(Q(namespace, "val"))
-                        if fmt_elem is not None
-                        else "decimal"
+                        fmt_elem.get(Q(namespace, "val")) if fmt_elem is not None else "decimal"
                     )
                     txt_elem = lvl.find(Q(namespace, "lvlText"))
-                    lvl_text = (
-                        txt_elem.get(Q(namespace, "val"))
-                        if txt_elem is not None
-                        else ""
-                    )
+                    lvl_text = txt_elem.get(Q(namespace, "val")) if txt_elem is not None else ""
                     st_elem = lvl.find(Q(namespace, "start"))
-                    st_str = (
-                        st_elem.get(Q(namespace, "val")) if st_elem is not None else "1"
-                    )
+                    st_str = st_elem.get(Q(namespace, "val")) if st_elem is not None else "1"
                     start_val = int(st_str) if st_str and st_str.isdigit() else 1
                     lvl_pic = lvl.find(Q(namespace, "lvlPicBulletId")) is not None
                     levels.append(
@@ -905,30 +861,20 @@ def discover_numbering_targets(
                     continue
                 nid = int(nid_str)
                 ab_ref = num.find(Q(namespace, "abstractNumId"))
-                ab_val_str = (
-                    ab_ref.get(Q(namespace, "val")) if ab_ref is not None else None
-                )
-                ab_val = (
-                    int(ab_val_str) if ab_val_str and ab_val_str.isdigit() else None
-                )
+                ab_val_str = ab_ref.get(Q(namespace, "val")) if ab_ref is not None else None
+                ab_val = int(ab_val_str) if ab_val_str and ab_val_str.isdigit() else None
                 overrides: list[dict[str, Any]] = []
                 for ov in num.findall(Q(namespace, "lvlOverride")):
                     ilvl_str = ov.get(Q(namespace, "ilvl"))
                     if not ilvl_str or not ilvl_str.isdigit():
                         continue
                     ov_start = ov.find(Q(namespace, "startOverride"))
-                    ov_val_str = (
-                        ov_start.get(Q(namespace, "val"))
-                        if ov_start is not None
-                        else None
-                    )
+                    ov_val_str = ov_start.get(Q(namespace, "val")) if ov_start is not None else None
                     overrides.append(
                         {
                             "ilvl": int(ilvl_str),
                             "start_override": (
-                                int(ov_val_str)
-                                if ov_val_str and ov_val_str.isdigit()
-                                else None
+                                int(ov_val_str) if ov_val_str and ov_val_str.isdigit() else None
                             ),
                         }
                     )
@@ -973,15 +919,11 @@ def discover_numbering_targets(
         ilvl_val: int | None = None
         if num_pr is not None:
             nid_elem = num_pr.find(Q(namespace, "numId"))
-            nid_str = (
-                nid_elem.get(Q(namespace, "val")) if nid_elem is not None else None
-            )
+            nid_str = nid_elem.get(Q(namespace, "val")) if nid_elem is not None else None
             if nid_str and nid_str.isdigit():
                 num_id_val = int(nid_str)
             ilvl_elem = num_pr.find(Q(namespace, "ilvl"))
-            ilvl_str = (
-                ilvl_elem.get(Q(namespace, "val")) if ilvl_elem is not None else None
-            )
+            ilvl_str = ilvl_elem.get(Q(namespace, "val")) if ilvl_elem is not None else None
             if ilvl_str and ilvl_str.isdigit():
                 ilvl_val = int(ilvl_str)
             elif num_id_val is not None:
@@ -1132,15 +1074,13 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                 lvl.find(Q(namespace, "lvlPicBulletId")) is not None
                 for lvl in abstract_elem.findall(Q(namespace, "lvl"))
             ):
-                return _numbering_refusal(
-                    request, "numbering_picture_bullet_unsupported"
-                )
+                return _numbering_refusal(request, "numbering_picture_bullet_unsupported")
 
             lvl = next(
                 (
-                    level
-                    for level in abstract_elem.findall(Q(namespace, "lvl"))
-                    if level.get(Q(namespace, "ilvl")) == str(edit.level)
+                    l
+                    for l in abstract_elem.findall(Q(namespace, "lvl"))
+                    if l.get(Q(namespace, "ilvl")) == str(edit.level)
                 ),
                 None,
             )
@@ -1148,9 +1088,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                 return _numbering_refusal(request, "numbering_level_invalid")
 
             fmt_elem = lvl.find(Q(namespace, "numFmt"))
-            fmt_val = (
-                fmt_elem.get(Q(namespace, "val")) if fmt_elem is not None else "decimal"
-            )
+            fmt_val = fmt_elem.get(Q(namespace, "val")) if fmt_elem is not None else "decimal"
             if fmt_val not in _NUMBER_FORMATS:
                 return _numbering_refusal(request, "numbering_definition_unsupported")
 
@@ -1178,9 +1116,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                     return _numbering_refusal(request, "numbering_abstract_num_missing")
                 num_ab_id = ab_ref.get(Q(namespace, "val"))
                 if resolved_ab_id is not None and num_ab_id != resolved_ab_id:
-                    return _numbering_refusal(
-                        request, "numbering_abstract_num_mismatch"
-                    )
+                    return _numbering_refusal(request, "numbering_abstract_num_mismatch")
                 resolved_ab_id = num_ab_id
 
             if not resolved_ab_id or resolved_ab_id not in abstract_nums:
@@ -1199,15 +1135,13 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                 lvl.find(Q(namespace, "lvlPicBulletId")) is not None
                 for lvl in abstract_elem.findall(Q(namespace, "lvl"))
             ):
-                return _numbering_refusal(
-                    request, "numbering_picture_bullet_unsupported"
-                )
+                return _numbering_refusal(request, "numbering_picture_bullet_unsupported")
 
             lvl = next(
                 (
-                    level
-                    for level in abstract_elem.findall(Q(namespace, "lvl"))
-                    if level.get(Q(namespace, "ilvl")) == str(edit.level)
+                    l
+                    for l in abstract_elem.findall(Q(namespace, "lvl"))
+                    if l.get(Q(namespace, "ilvl")) == str(edit.level)
                 ),
                 None,
             )
@@ -1215,9 +1149,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                 return _numbering_refusal(request, "numbering_level_invalid")
 
             fmt_elem = lvl.find(Q(namespace, "numFmt"))
-            fmt_val = (
-                fmt_elem.get(Q(namespace, "val")) if fmt_elem is not None else "decimal"
-            )
+            fmt_val = fmt_elem.get(Q(namespace, "val")) if fmt_elem is not None else "decimal"
             if fmt_val not in _NUMBER_FORMATS:
                 return _numbering_refusal(request, "numbering_definition_unsupported")
 
@@ -1256,9 +1188,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
             effective_num_id = edit.num_id
             num_elem = nums[str(effective_num_id)]
             ab_ref = num_elem.find(Q(namespace, "abstractNumId"))
-            ab_id_int = (
-                int(ab_ref.get(Q(namespace, "val"), "0")) if ab_ref is not None else 0
-            )
+            ab_id_int = int(ab_ref.get(Q(namespace, "val"), "0")) if ab_ref is not None else 0
             numbering_records.append(
                 {
                     "num_id": effective_num_id,
@@ -1268,9 +1198,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                     "start_override": None,
                 }
             )
-            _apply_num_pr_to_paragraph(
-                target_p, namespace, effective_num_id, edit.level
-            )
+            _apply_num_pr_to_paragraph(target_p, namespace, effective_num_id, edit.level)
             changed_targets.append(
                 {
                     "paragraph": edit.paragraph,
@@ -1314,9 +1242,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
                     "start_override": start_val,
                 }
             )
-            _apply_num_pr_to_paragraph(
-                target_p, namespace, effective_num_id, edit.level
-            )
+            _apply_num_pr_to_paragraph(target_p, namespace, effective_num_id, edit.level)
             changed_targets.append(
                 {
                     "paragraph": edit.paragraph,
@@ -1370,11 +1296,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
         disc_targets = {t["paragraph"]: t for t in disc["targets"]}
         for ct in changed_targets:
             p_info = disc_targets.get(ct["paragraph"])
-            if (
-                p_info is None
-                or p_info["num_id"] != ct["num_id"]
-                or p_info["level"] != ct["level"]
-            ):
+            if p_info is None or p_info["num_id"] != ct["num_id"] or p_info["level"] != ct["level"]:
                 return "numbering_staged_verification_failed"
         disc_nums = {n["num_id"]: n for n in disc["nums"]}
         for num_id, (ab_id, level, start) in allocated_restarts.items():
@@ -1382,8 +1304,7 @@ def author_numbering(request: NumberingRequest) -> NumberingReport:
             if (
                 staged_num is None
                 or staged_num["abstract_num_id"] != ab_id
-                or {"ilvl": level, "start_override": start}
-                not in staged_num["level_overrides"]
+                or {"ilvl": level, "start_override": start} not in staged_num["level_overrides"]
             ):
                 return "numbering_staged_verification_failed"
         return None

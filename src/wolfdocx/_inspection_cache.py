@@ -16,7 +16,7 @@ The store is a SQLite database below the WolfDocx cache root
 ``WOLFDOCX_INSPECTION_CACHE=off`` to disable it. Gates run with it suspended unless
 ``WOLFDOCX_GATE_INSPECTION_CACHE=on`` (see :func:`gate_scope`). Every failure to open,
 read, or write it disables it for the rest of the process, so inspection falls back to
-parsing every part.
+parsing every part. See ``docs/inspection-cache.md`` for the trust boundary.
 """
 
 from __future__ import annotations
@@ -50,8 +50,10 @@ MAX_ROWS = 200_000
 # stored; once the total exceeds its bound the oldest values go first.
 MAX_VALUE_BYTES = 4 * 1024 * 1024
 MAX_VALUE_TOTAL_BYTES = 128 * 1024 * 1024
-# Stored facts depend on the bounded parser, descriptive stage, hashing and model.
-_IDENTITY_MODULES = ("inspect.py", "canonical.py", "model.py")
+# Code whose behavior decides stored facts: the bounded parser, the per-part
+# signature-line diagnostics, and the descriptive stage (inspect.py with the canonical
+# hashing and report model it builds).
+_IDENTITY_MODULES = ("inspect.py", "signature_line.py", "canonical.py", "model.py")
 
 _lock = threading.Lock()
 # One store (or ``None`` once it failed) per process and database path.

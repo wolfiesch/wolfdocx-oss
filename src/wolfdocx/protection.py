@@ -3,12 +3,13 @@
 This module implements atomic authoring and discovery of document editing restrictions
 (documentProtection) in ``word/settings.xml`` per ECMA-376 / ISO/IEC 29500:
 - Supported editing restriction modes: ``readOnly``, ``comments``, ``trackedChanges``, ``forms``
-- Explicit removal of document protection
+- Explicit removal of document protection, with authentication for supported password verifiers
 - Enforcement flag (``w:enforcement="1"`` or ``"0"``)
 - Formatting restrictions flag (``w:formatting="1"`` or ``"0"``)
 - Strict OOXML schema ordering within ``w:settings``
 - Safe creation of ``word/settings.xml``, document relationships, and content type
   overrides when absent
+- Discovery of opaque legacy and agile verifier attributes without exposing their values
 - Cryptographic / password metadata boundary enforcement: editing restrictions are not encryption;
   existing cryptographic metadata and foreign settings are never silently discarded
 - Reusable no-clobber publication via ``wolfdocx.review._publish``
@@ -27,7 +28,7 @@ import json
 import os
 import zipfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -127,7 +128,6 @@ _CRYPT_ATTRIBUTES = frozenset(
 
 _FORBIDDEN_REQUEST_CRYPTO_KEYS = frozenset(
     {
-        "password",
         "pass",
         "pwd",
         "crypto",
@@ -476,6 +476,8 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "formatting",
         "part",
         "permission_ranges",
+        "password",
+        "current_password",
     }
 )
 
@@ -668,6 +670,87 @@ def _parse_permission_ranges(value: Any) -> tuple[PermissionRange, ...]:
     return tuple(ranges)
 
 
+def _validate_document_password(password: Any) -> None:
+    # The legacy verifier consumes at most 15 UTF-16 code units. Refuse ambiguous
+    # truncation and the leading BOM stripped by the shared hashing helper.
+    if not isinstance(password, str):
+        raise TypeError("protection_password_invalid")
+    if not 1 <= len(password) <= 15 or password.startswith("\ufeff"):
+        raise ValueError("protection_password_invalid")
+    try:
+        encoded = password.encode("utf-16le")
+    except UnicodeEncodeError:
+        raise ValueError("protection_password_invalid") from None
+    if len(encoded) > 30:
+        raise ValueError("protection_password_invalid")
+
+
+_DOCUMENT_VERIFIER_KEYS = frozenset(
+    {
+        "cryptProviderType",
+        "cryptAlgorithmClass",
+        "cryptAlgorithmType",
+        "cryptAlgorithmSid",
+        "cryptSpinCount",
+        "hash",
+        "salt",
+    }
+)
+_DOCUMENT_OPAQUE_KEYS = _CRYPT_ATTRIBUTES | frozenset(
+    {"algorithmName", "spinCount", "hashValue", "saltValue", "password"}
+)
+
+
+def _authenticate_document_protection(
+    element: ET.Element, namespace: str, password: str | None
+) -> dict[str, str]:
+    """Validate bounded untrusted metadata, then authenticate; never return secrets."""
+    allowed = _DOCUMENT_VERIFIER_KEYS | {"edit", "enforcement", "formatting"}
+    qualified = {Q(namespace, name) for name in allowed}
+    if not set(element.attrib).issubset(qualified):
+        raise ValueError("protection_cryptographic_metadata_present")
+    attributes = {
+        key.rsplit("}", 1)[-1]: value
+        for key, value in element.attrib.items()
+        if key.rsplit("}", 1)[-1] in _DOCUMENT_VERIFIER_KEYS
+    }
+    if not attributes:
+        if password is not None:
+            raise ValueError("protection_password_verifier_missing")
+        return {}
+    if attributes.keys() != _DOCUMENT_VERIFIER_KEYS:
+        raise ValueError("protection_cryptographic_metadata_present")
+    if (
+        attributes["cryptProviderType"] != "rsaAES"
+        or attributes["cryptAlgorithmClass"] != "hash"
+        or attributes["cryptAlgorithmType"] != "typeAny"
+        or attributes["cryptAlgorithmSid"] != "14"
+    ):
+        raise ValueError("protection_cryptographic_metadata_present")
+    spin = attributes["cryptSpinCount"]
+    if not 1 <= len(spin) <= 7 or not spin.isascii() or not spin.isdecimal():
+        raise ValueError("protection_spin_count_invalid")
+    spins = int(spin)
+    if spins > 5000000:
+        raise ValueError("protection_spin_count_invalid")
+    # Bound decoding as well as hashing, before allocating decoded buffers.
+    if len(attributes["salt"]) != 24 or len(attributes["hash"]) != 88:
+        raise ValueError("protection_password_verifier_invalid")
+    try:
+        salt = base64.b64decode(attributes["salt"], validate=True)
+        expected = base64.b64decode(attributes["hash"], validate=True)
+    except ValueError:
+        raise ValueError("protection_password_verifier_invalid") from None
+    if len(salt) != 16 or len(expected) != 64:
+        raise ValueError("protection_password_verifier_invalid")
+    if password is None:
+        raise ValueError("protection_password_required")
+    actual = protection_password_hash(password, salt=salt, spin_count=spins)
+    if not hmac.compare_digest(base64.b64decode(actual["hash"]), expected):
+        raise ValueError("protection_password_incorrect")
+    return {Q(namespace, key): value for key, value in attributes.items()}
+
+
 @dataclass(frozen=True)
 class ProtectionRequest:
     """Strict request for modifying or removing document editing restrictions."""
@@ -682,6 +765,8 @@ class ProtectionRequest:
     formatting: bool = False
     part: str = _SETTINGS
     permission_ranges: tuple[PermissionRange, ...] = ()
+    password: str | None = field(default=None, repr=False)
+    current_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, Path):
@@ -714,6 +799,11 @@ class ProtectionRequest:
             raise ValueError("protection_edit_mode_unsupported")
         if self.part != _SETTINGS:
             raise ValueError("protection_part_unsupported")
+        for secret in (self.password, self.current_password):
+            if secret is not None:
+                _validate_document_password(secret)
+        if self.action == "remove" and self.password is not None:
+            raise ValueError("protection_password_action_invalid")
         ranges = tuple(self.permission_ranges)
         if len(ranges) > _MAX_PERMISSION_RANGES or not all(
             isinstance(item, PermissionRange) for item in ranges
@@ -866,6 +956,10 @@ def parse_protection_request(value: Any) -> ProtectionRequest:
     if not isinstance(part, str) or part != _SETTINGS:
         raise ValueError("protection_part_unsupported")
 
+    for name in ("password", "current_password"):
+        if name in value:
+            _validate_document_password(value[name])
+
     permission_ranges = (
         _parse_permission_ranges(value["permission_ranges"]) if "permission_ranges" in value else ()
     )
@@ -881,6 +975,8 @@ def parse_protection_request(value: Any) -> ProtectionRequest:
         formatting=formatting,
         part=part,
         permission_ranges=permission_ranges,
+        password=value.get("password"),
+        current_password=value.get("current_password"),
     )
 
 
@@ -1128,7 +1224,7 @@ def discover_protection_targets(
     crypt_attrs: dict[str, str] = {}
     for k, v in dp_elem.attrib.items():
         local = k.rsplit("}", 1)[-1]
-        if local in _CRYPT_ATTRIBUTES:
+        if local in _DOCUMENT_OPAQUE_KEYS:
             crypt_attrs[local] = v
 
     protection_data = {
@@ -1346,12 +1442,41 @@ def author_protection(
     if req.part != _SETTINGS:
         return _protection_refusal(req, "protection_part_unsupported")
 
+    try:
+        document_ns = _word_namespace(ET.fromstring(graph.read_part_bytes(_DOCUMENT)))
+    except (ET.ParseError, PackageError):
+        return _protection_refusal(req, "protection_package_invalid")
+    if document_ns is None:
+        return _protection_refusal(req, "protection_package_invalid")
+
+    # This API binds the canonical settings part. Never bypass a verifier in a
+    # relationship-targeted alternate part, including with a canonical decoy.
+    settings_relationships = [
+        rel
+        for rel in graph.relationships_for(_DOCUMENT)
+        if rel.source_part == _DOCUMENT and rel.type.rsplit("/", 1)[-1] == "settings"
+    ]
+    if bool(settings_relationships) != (_SETTINGS in graph.parts):
+        return _protection_refusal(req, "protection_structure_unsupported")
+    if len(settings_relationships) > 1 or any(
+        rel.is_external
+        or rel.resolved_target() != _SETTINGS
+        or rel.type
+        not in {
+            f"{_R}/settings",
+            "http://purl.oclc.org/ooxml/officeDocument/relationships/settings",
+        }
+        for rel in settings_relationships
+    ):
+        return _protection_refusal(req, "protection_structure_unsupported")
+
     actual_fp = protection_structure_fingerprint(source, part=req.part)
     if actual_fp != req.structure_fingerprint_sha256:
         return _protection_refusal(req, "protection_structure_fingerprint_mismatch")
 
     replacements: dict[str, bytes] = {}
     additions: dict[str, bytes] = {}
+    verifier_attributes: dict[str, str] = {}
 
     if _SETTINGS not in graph.parts:
         # Settings part absent
@@ -1365,12 +1490,19 @@ def author_protection(
             return _protection_refusal(req, "protection_package_invalid")
 
         ns = _word_namespace(doc_root) or _W
+        if req.current_password is not None:
+            return _protection_refusal(req, "protection_password_verifier_missing")
+        if req.password is not None:
+            verifier_attributes = {
+                Q(ns, key): value for key, value in protection_password_hash(req.password).items()
+            }
 
         # Create new word/settings.xml
         settings_root = ET.Element(Q(ns, "settings"))
         dp_elem = ET.SubElement(settings_root, Q(ns, "documentProtection"))
         dp_elem.set(Q(ns, "edit"), req.edit)  # type: ignore[arg-type]
         dp_elem.set(Q(ns, "enforcement"), "1" if req.enforcement else "0")
+        dp_elem.attrib.update(verifier_attributes)
         if req.formatting:
             dp_elem.set(Q(ns, "formatting"), "1")
 
@@ -1395,12 +1527,17 @@ def author_protection(
                 Q(_PR, "Relationship"),
                 {
                     "Id": settings_rel_id,
-                    "Type": f"{_R}/settings",
+                    "Type": (
+                        f"{_R}/settings"
+                        if ns == _W
+                        else "http://purl.oclc.org/ooxml/officeDocument/relationships/settings"
+                    ),
                     "Target": "settings.xml",
                 },
             )
         )
-        replacements[rels_name] = serialize_xml_with_preserved_qnames(rels_root)
+        relationships = replacements if rels_name in graph.parts else additions
+        relationships[rels_name] = serialize_xml_with_preserved_qnames(rels_root)
 
         # Load [Content_Types].xml to add override for word/settings.xml
         if "[Content_Types].xml" not in graph.parts:
@@ -1434,11 +1571,15 @@ def author_protection(
         except (ET.ParseError, PackageError):
             return _protection_refusal(req, "protection_settings_invalid")
 
-        local_root_name = settings_root.tag.rsplit("}", 1)[-1]
-        if local_root_name != "settings":
+        settings_ns = _word_namespace(settings_root)
+        if settings_ns != document_ns or settings_root.tag != Q(settings_ns, "settings"):
             return _protection_refusal(req, "protection_settings_invalid")
-
-        settings_ns = _word_namespace(settings_root) or _W
+        if any(
+            child.tag.rsplit("}", 1)[-1] == "documentProtection"
+            and child.tag != Q(settings_ns, "documentProtection")
+            for child in settings_root
+        ):
+            return _protection_refusal(req, "protection_structure_unsupported")
         existing_protects = settings_root.findall(Q(settings_ns, "documentProtection"))
 
         if len(existing_protects) > 1:
@@ -1450,12 +1591,20 @@ def author_protection(
             if len(existing_protect) > 0:
                 return _protection_refusal(req, "protection_structure_unsupported")
 
-            # Check for cryptographic / password metadata on existing element
-            has_crypto = any(
-                k.rsplit("}", 1)[-1] in _CRYPT_ATTRIBUTES for k in existing_protect.attrib
-            )
-            if has_crypto:
-                return _protection_refusal(req, "protection_cryptographic_metadata_present")
+            try:
+                verifier_attributes = _authenticate_document_protection(
+                    existing_protect, settings_ns, req.current_password
+                )
+            except ValueError as exc:
+                return _protection_refusal(req, str(exc))
+        elif req.current_password is not None:
+            return _protection_refusal(req, "protection_password_verifier_missing")
+
+        if req.password is not None:
+            verifier_attributes = {
+                Q(settings_ns, key): value
+                for key, value in protection_password_hash(req.password).items()
+            }
 
         if req.action == "remove":
             if not existing_protects:
@@ -1468,13 +1617,14 @@ def author_protection(
                 # Update existing element in place
                 target_elem = existing_protects[0]
                 target_elem.attrib.clear()
+                target_elem.attrib.update(verifier_attributes)
                 target_elem.set(Q(settings_ns, "edit"), req.edit)  # type: ignore[arg-type]
                 target_elem.set(Q(settings_ns, "enforcement"), "1" if req.enforcement else "0")
                 if req.formatting:
                     target_elem.set(Q(settings_ns, "formatting"), "1")
             else:
                 # Insert new element maintaining strict schema order
-                new_dp = ET.Element(Q(settings_ns, "documentProtection"))
+                new_dp = ET.Element(Q(settings_ns, "documentProtection"), verifier_attributes)
                 new_dp.set(Q(settings_ns, "edit"), req.edit)  # type: ignore[arg-type]
                 new_dp.set(Q(settings_ns, "enforcement"), "1" if req.enforcement else "0")
                 if req.formatting:
@@ -1538,6 +1688,14 @@ def author_protection(
                 if dp_fmt is not None and dp_fmt.lower() in {"1", "true", "on"}:
                     return "protection_staged_verification_failed"
 
+            staged_verifier = {
+                key: value
+                for key, value in dp.attrib.items()
+                if key.rsplit("}", 1)[-1] in _DOCUMENT_OPAQUE_KEYS
+            }
+            if staged_verifier != verifier_attributes:
+                return "protection_staged_verification_failed"
+
             # Check schema ordering
             children = list(staged_settings)
             dp_idx = children.index(dp)
@@ -1563,16 +1721,24 @@ def author_protection(
                 rels_name = _rels_name(_DOCUMENT)
                 if rels_name not in staged_graph.parts:
                     return "protection_staged_verification_failed"
-                try:
-                    s_rels = ET.fromstring(staged_graph.read_part_bytes(rels_name))
-                    has_rel = any(
-                        r.get("Target") == "settings.xml"
-                        or (r.get("Type") or "").endswith("/settings")
-                        for r in s_rels.findall(Q(_PR, "Relationship"))
-                    )
-                    if not has_rel:
-                        return "protection_staged_verification_failed"
-                except (ET.ParseError, PackageError):
+                staged_relationships = [
+                    rel
+                    for rel in staged_graph.relationships_for(_DOCUMENT)
+                    if rel.source_part == _DOCUMENT and rel.type.rsplit("/", 1)[-1] == "settings"
+                ]
+                expected_type = (
+                    f"{_R}/settings"
+                    if document_ns == _W
+                    else "http://purl.oclc.org/ooxml/officeDocument/relationships/settings"
+                )
+                if len(staged_relationships) != 1:
+                    return "protection_staged_verification_failed"
+                relationship = staged_relationships[0]
+                if (
+                    relationship.is_external
+                    or relationship.type != expected_type
+                    or relationship.resolved_target() != _SETTINGS
+                ):
                     return "protection_staged_verification_failed"
 
                 if "[Content_Types].xml" not in staged_graph.parts:

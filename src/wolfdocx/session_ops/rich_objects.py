@@ -1,4 +1,31 @@
-"""Byte-preserving package edits, node bindings, and verified DOCX publication."""
+"""One DOCX package opened once, edited in memory, and published without clobbering.
+
+:class:`Document` validates the package graph, member CRCs and bounded main-story
+XML before opening. Explicit load options require whole-package admission or
+verified recovery unless the caller requests deferred part validation for
+diagnosis or opaque preservation. Other parts are parsed when an edit needs them.
+Every edit reuses its stateless counterpart; a refusal leaves the session
+unchanged. :meth:`Document.append_paragraph`, :meth:`Document.set_cell_text`,
+:meth:`Document.find_replace`, and the paragraph and run edits plan in memory with
+the stateless planning step. Table, picture, section, page-setup, header and footer,
+list numbering, and styling edits (:mod:`wolfdocx.session_ops`), and the comment,
+footnote and endnote, bookmark, hyperlink, field and table-of-contents, content
+control, watermark, and text box edits (:class:`RichObjectEdits`) run the stateless
+operation itself against the session's current package in a private scratch directory
+and adopt its output, including parts it adds or removes.
+
+:meth:`Document.save` copies every unchanged ZIP member's compressed bytes and
+entry metadata from the source and writes only the changed and added parts.
+Without changes, the staged digest must equal the admitted immutable source
+digest, preserving every byte without another package parse. With changes,
+the staged package must validate as a package graph, every
+unchanged member must hold the source's compressed bytes, every changed
+relationship or content-type part must hold its intended bytes, each changed part
+must re-parse under the package limits, and note references are re-checked when
+the story or a notes part changed or a part was removed. Unchanged parts are never
+parsed, so the aggregate element limit covers the changed parts only. The staged
+file is published with a hard link, which never replaces an existing destination.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +36,7 @@ import re
 import struct
 import tempfile
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -17,7 +44,8 @@ from typing import TYPE_CHECKING, Any, BinaryIO, cast
 from xml.etree import ElementTree as ET
 from xml.parsers import expat
 
-from ..document import Document
+from .._optional import feature_module
+from ..canonical import sha256_bytes, sha256_file
 from ..inspect import Q, _parse_bounded_xml, _verify_staged_changes, _XmlSafetyError
 from ..model import (
     DocumentVisitor,
@@ -29,11 +57,23 @@ from ..model import (
     NodeType,
     StoryType,
     VisitorAction,
+    _FieldTextState,
 )
-from ..output import SaveOutputParameters
+from ..output import (
+    OoxmlCompliance,
+    OoxmlSaveOptions,
+    SaveOptionsError,
+    SaveOutputParameters,
+    TxtExportHeadersFootersMode,
+    TxtOfficeMathExportMode,
+    TxtSaveOptions,
+    Zip64Mode,
+    _apply_save_properties,
+)
 from ..package import PackageError, PackageGraph, PackageLimits
 from . import (
     ListEdits,
+    PictureEdits,
     RunEdits,
     SectionEdits,
     SessionEditReport,
@@ -41,14 +81,16 @@ from . import (
     TableEdits,
 )
 from ._bridge import _APPLIED as _EDIT_APPLIED
-from ._bridge import operation_detail
+from ._bridge import EditHost, Staged, bound_fingerprint, operation_detail
 from ._bridge import refused as _edit_refused
 
 if TYPE_CHECKING:
     from ..authoring import CellTextAuthoringReport
     from ..find_replace import FindReplaceOptions, FindReplaceReport
+    from ..load_options import LoadOptions, LoadReport
     from ..paragraph_authoring import ParagraphReport, ParagraphRequest
     from ..render_warnings import WarningCollection
+    from ..web_extensions import WebAddIns
 
 
 def _plan_paragraph_edit(*args: Any, **kwargs: Any) -> Any:
@@ -58,6 +100,7 @@ def _plan_paragraph_edit(*args: Any, **kwargs: Any) -> Any:
     return _plan_paragraph_edit(*args, **kwargs)
 
 
+from ..document import Document, _load_refusal
 
 __all__ = ["DocumentOperations", "SessionSaveReport"]
 
@@ -75,7 +118,9 @@ class SessionSaveReport(SaveOutputParameters):
     added_parts: tuple[str, ...] = ()
     removed_parts: tuple[str, ...] = ()
     raw_copied_parts: int = 0
+    load_recovery: tuple[str, ...] = ()
     edits: tuple[Mapping[str, Any], ...] = ()
+    invalidated_signatures: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -95,7 +140,9 @@ class SessionSaveReport(SaveOutputParameters):
             "added_parts": list(self.added_parts),
             "removed_parts": list(self.removed_parts),
             "raw_copied_parts": self.raw_copied_parts,
+            "load_recovery": list(self.load_recovery),
             "edits": [dict(edit) for edit in self.edits],
+            "invalidated_signatures": list(self.invalidated_signatures),
         }
 
 
@@ -117,6 +164,11 @@ _LOCAL_FILE_HEADER = b"PK\x03\x04"
 _LOCAL_FILE_HEADER_SIZE = 30
 _ZIP64_EXTRA_ID = 0x0001
 _NOTE_RELATIONSHIPS = ("/footnotes", "/endnotes")
+# Same value as wolfdocx.package_signatures._SIGNATURE_CONTENT_TYPE: a package
+# without signature parts has no signature a save can invalidate.
+_SIGNATURE_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml"
+)
 _PART_ERRORS = (PackageError, KeyError, OSError, ET.ParseError, _XmlSafetyError)
 # Entries, changed parts, package graph, and edit count: what a refusal restores.
 _Snapshot = tuple[dict[str, zipfile.ZipInfo], dict[str, bytes], PackageGraph, int]
@@ -563,43 +615,1232 @@ def _copy_member_raw(out: zipfile.ZipFile, info: zipfile.ZipInfo, raw: memoryvie
 
 _TRANSITIONAL_BASE = "http://schemas.openxmlformats.org/"
 _STRICT_BASE = "http://purl.oclc.org/ooxml/"
+# ECMA-376 Part 1 namespace table. OPC namespaces remain unchanged.
+_OOXML_NAMESPACE_PATHS = (
+    "wordprocessingml/main",
+    "drawingml/main",
+    "drawingml/chart",
+    "drawingml/chartDrawing",
+    "drawingml/diagram",
+    "drawingml/picture",
+    "drawingml/spreadsheetDrawing",
+    "drawingml/wordprocessingDrawing",
+    "spreadsheetml/main",
+    "presentationml/main",
+    "officeDocument/math",
+    "officeDocument/relationships",
+    "officeDocument/extended-properties",
+    "officeDocument/custom-properties",
+    "officeDocument/docPropsVTypes",
+    "officeDocument/bibliography",
+    "officeDocument/customXml",
+    "officeDocument/characteristics",
+    "officeDocument/sharedTypes",
+)
+_OOXML_NAMESPACES = {
+    _TRANSITIONAL_BASE + path.replace("/", "/2006/", 1): _STRICT_BASE + path
+    for path in _OOXML_NAMESPACE_PATHS
+}
+# Property namespaces and relationship names are hyphenated in Transitional.
+# Strict uses camelCase for both; neither is a mechanical base-URI substitution.
+_OOXML_NAMESPACES.update(
+    {
+        _TRANSITIONAL_BASE + "officeDocument/2006/extended-properties": _STRICT_BASE
+        + "officeDocument/extendedProperties",
+        _TRANSITIONAL_BASE + "officeDocument/2006/custom-properties": _STRICT_BASE
+        + "officeDocument/customProperties",
+        _TRANSITIONAL_BASE + "officeDocument/2006/relationships/extended-properties": _STRICT_BASE
+        + "officeDocument/relationships/extendedProperties",
+        _TRANSITIONAL_BASE + "officeDocument/2006/relationships/custom-properties": _STRICT_BASE
+        + "officeDocument/relationships/customProperties",
+    }
+)
+_XML_ATTRIBUTE = re.compile(rb"""([\w:.-]+)(\s*=\s*)(["'])(.*?)\3""", re.DOTALL)
+_XML_TAG = re.compile(
+    rb"""<!--.*?-->|<!\[CDATA\[.*?\]\]>|<([A-Za-z_][\w:.-]*)(?:[^"'<>]|"[^"]*"|'[^']*')*>""",
+    re.DOTALL,
+)
+
+
+def _xml_utf8(data: bytes) -> bytes:
+    """Normalize non-UTF-8 XML encodings only on explicit OOXML conversion."""
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        text = data.decode("utf-32")
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16")
+    elif data.startswith(b"\x00<"):
+        text = data.decode("utf-16-be")
+    elif data.startswith(b"<\x00"):
+        text = data.decode("utf-16-le")
+    else:
+        declaration = re.match(
+            rb"""(?:\xef\xbb\xbf)?<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']""", data
+        )
+        encoding = declaration.group(1).decode("ascii") if declaration else "utf-8"
+        if encoding.lower().replace("_", "-") in {"utf-8", "utf8"}:
+            return data
+        text = data.decode(encoding)
+    text = re.sub(r"""(<\?xml[^>]*encoding\s*=\s*["'])[^"']+""", r"\1UTF-8", text, count=1)
+    return text.encode("utf-8")
+
+
+def _convert_ooxml(data: bytes, *, strict: bool, main: bool, limits: PackageLimits) -> bytes:
+    root = _parse_part(data, limits, editable=False)
+    if main and root.tag not in {
+        Q(_TRANSITIONAL_BASE + "wordprocessingml/2006/main", "document"),
+        Q(_STRICT_BASE + "wordprocessingml/main", "document"),
+    }:
+        raise SaveOptionsError("ooxml_document_namespace_unsupported")
+    if strict and any(
+        isinstance(node.tag, str) and node.tag.startswith("{urn:schemas-microsoft-com:vml}")
+        for node in root.iter()
+    ):
+        raise SaveOptionsError("ooxml_strict_vml_unsupported")
+    mapping = _OOXML_NAMESPACES if strict else {v: k for k, v in _OOXML_NAMESPACES.items()}
+    ordered_mapping = sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True)
+    data = _xml_utf8(data)
+    # Rename only direct Word table-border children. Byte offsets retain prefixes,
+    # whitespace, attributes, comments and unrelated left/right elements.
+    word_namespaces = {
+        _TRANSITIONAL_BASE + "wordprocessingml/2006/main",
+        _STRICT_BASE + "wordprocessingml/main",
+    }
+    sides = {"left": "start", "right": "end"} if strict else {"start": "left", "end": "right"}
+    parser = expat.ParserCreate(namespace_separator="}")
+    stack: list[tuple[str, str | None, bool]] = []
+    patches: list[tuple[int, int, bytes]] = []
+
+    def border_start(name: str, attributes: dict[str, str]) -> None:
+        namespace, _, local = name.rpartition("}")
+        replacement = (
+            sides.get(local)
+            if namespace in word_namespaces and stack and stack[-1][0] == namespace + "}tblBorders"
+            else None
+        )
+        offset = parser.CurrentByteIndex
+        opening_tag = _XML_TAG.match(data, offset)
+        assert opening_tag is not None
+        empty = opening_tag.group().rstrip().endswith(b"/>")
+        if replacement is not None:
+            opening = re.match(rb"<([\w:.-]+)", data[offset:])
+            assert opening is not None
+            begin, end = opening.span(1)
+            prefix = opening.group(1).rpartition(b":")[0]
+            qname = (prefix + b":" if prefix else b"") + replacement.encode()
+            patches.append((offset + begin, offset + end, qname))
+        stack.append((name, replacement, empty))
+
+    def border_end(name: str) -> None:
+        _, replacement, empty = stack.pop()
+        if replacement is not None and not empty:
+            offset = parser.CurrentByteIndex
+            closing = re.match(rb"</([\w:.-]+)", data[offset:])
+            assert closing is not None
+            begin, end = closing.span(1)
+            prefix = closing.group(1).rpartition(b":")[0]
+            qname = (prefix + b":" if prefix else b"") + replacement.encode()
+            patches.append((offset + begin, offset + end, qname))
+
+    parser.StartElementHandler = border_start
+    parser.EndElementHandler = border_end
+    parser.Parse(data, True)
+    for begin, end, replacement in reversed(patches):
+        data = data[:begin] + replacement + data[end:]
+    relationships = (
+        root.tag == "{http://schemas.openxmlformats.org/package/2006/relationships}Relationships"
+    )
+
+    def attribute(match: re.Match[bytes]) -> bytes:
+        name, equal, quote, raw = match.groups()
+        value = raw.decode("utf-8")
+        if name.startswith(b"xmlns") or (relationships and name == b"Type"):
+            # Match specific relationship exceptions before their common base.
+            for old, new in ordered_mapping:
+                if value == old or (name == b"Type" and value.startswith(old + "/")):
+                    value = new + value[len(old) :]
+                    break
+        return name + equal + quote + value.encode("utf-8") + quote
+
+    result = _XML_TAG.sub(
+        lambda match: (
+            _XML_ATTRIBUTE.sub(attribute, match.group()) if match.group(1) else match.group()
+        ),
+        data,
+    )
+    if main:
+        word = (
+            _STRICT_BASE + "wordprocessingml/main"
+            if strict
+            else (_TRANSITIONAL_BASE + "wordprocessingml/2006/main")
+        )
+        # Only the root start tag is changed, preserving lexical QNames and text.
+        opening = next(
+            (
+                match
+                for match in _XML_TAG.finditer(result)
+                if match.group(1) and match.group(1).split(b":")[-1] == b"document"
+            ),
+            None,
+        )
+        if opening is None:
+            raise SaveOptionsError("ooxml_document_namespace_unsupported")
+        tag = opening.group()
+        declaration = re.search(
+            rb"""xmlns:([\w.-]+)\s*=\s*["']""" + re.escape(word.encode()) + rb"""["']""",
+            tag,
+        )
+        prefix = declaration.group(1) if declaration else b"wdSave"
+        tag = re.sub(rb"""\s+[\w.-]+:conformance\s*=\s*(["']).*?\1""", b"", tag)
+        addition = b""
+        if declaration is None:
+            addition += b" xmlns:" + prefix + b'="' + word.encode() + b'"'
+        addition += (
+            b" " + prefix + b':conformance="' + (b"strict" if strict else b"transitional") + b'"'
+        )
+        result = result[: opening.start()] + tag[:-1] + addition + b">" + result[opening.end() :]
+    return result
+
+
 def _main_part(graph: PackageGraph) -> str:
     for relationship in graph.relationships:
         if relationship.type.endswith("/officeDocument") and not relationship.is_external:
             return relationship.resolved_target()
-    raise NodeEditError("document_main_part_missing")
+    raise SaveOptionsError("document_main_part_missing")
 
 
+def _save_ooxml(data: bytes, options: OoxmlSaveOptions, limits: PackageLimits) -> bytes:
+    strict = options.compliance == OoxmlCompliance.STRICT
+    graph = PackageGraph.from_bytes(data, path=Path("save.docx"), limits=limits)
+    main = _main_part(graph)
+    # Explicit defaults retain the raw-copy default for Transitional sources.
+    if (
+        options.compliance == OoxmlCompliance.TRANSITIONAL
+        and options.compression_level is None
+        and options.zip64_mode == Zip64Mode.AS_NEEDED
+        and not options.export_legacy_control_characters
+    ) and _parse_part(graph.read_part_bytes(main), limits, editable=False).tag == Q(
+        _TRANSITIONAL_BASE + "wordprocessingml/2006/main", "document"
+    ):
+        return data
+    from ..web_extensions import _preserved_parts
+
+    opaque = _preserved_parts(graph)
+    opaque.discard(main)
+    opaque.add("[Content_Types].xml")
+    buffer = BytesIO()
+    expected: dict[str, bytes] = {}
+    try:
+        with (
+            zipfile.ZipFile(BytesIO(data)) as source,
+            zipfile.ZipFile(
+                buffer, "w", allowZip64=options.zip64_mode != Zip64Mode.NEVER
+            ) as output,
+        ):
+            output.comment = source.comment
+            for original in source.infolist():
+                original_payload = payload = source.read(original)
+                content_type = graph.parts[original.filename].content_type
+                if original.filename not in opaque and (
+                    original.filename.endswith((".xml", ".rels", ".vml"))
+                    or content_type.endswith("+xml")
+                    or content_type in {"application/xml", "text/xml"}
+                ):
+                    if options.compliance == OoxmlCompliance.ECMA_376_2006:
+                        payload = _first_edition_ooxml(payload, limits)
+                    payload = _convert_ooxml(
+                        payload,
+                        strict=strict,
+                        main=original.filename == main,
+                        limits=limits,
+                    )
+                    if options.compliance == OoxmlCompliance.ECMA_376_2006:
+                        payload = _first_edition_ooxml(payload, limits)
+                    if options.export_legacy_control_characters:
+                        payload = _legacy_control_ooxml(payload, limits)
+                expected[original.filename] = payload
+                if (
+                    options.compression_level is None
+                    and options.zip64_mode == Zip64Mode.AS_NEEDED
+                    and payload == original_payload
+                ):
+                    _copy_member_raw(output, original, _raw_member(data, original))
+                    continue
+                entry = copy.copy(original)
+                entry.extra = _without_zip64_extra(entry.extra)
+                entry.file_size = len(payload)
+                if (
+                    options.zip64_mode == Zip64Mode.NEVER
+                    and len(payload) * 1.05 > zipfile.ZIP64_LIMIT
+                ):
+                    raise SaveOptionsError("ooxml_zip64_required")
+                if options.compression_level is not None:
+                    entry.compress_type = zipfile.ZIP_DEFLATED
+                    entry._compresslevel = options.compression_level
+                with output.open(
+                    entry, "w", force_zip64=options.zip64_mode == Zip64Mode.ALWAYS
+                ) as stream:
+                    stream.write(payload)
+    except zipfile.LargeZipFile as exc:
+        raise SaveOptionsError("ooxml_zip64_required") from exc
+    result = buffer.getvalue()
+    admitted = PackageGraph.from_bytes(result, path=Path("save.docx"), limits=limits)
+    if any(admitted.read_part_bytes(name) != payload for name, payload in expected.items()):
+        raise SaveOptionsError("ooxml_staged_verification_failed")
+    return result
 
 
+def _first_edition_ooxml(data: bytes, limits: PackageLimits) -> bytes:
+    """Downgrade admitted 2008 direction properties to the first-edition names.
+
+    Later extension semantics without a native downgrade refuse. Escaped
+    control-looking literal text is not interpreted as an OOXML Xstring.
+    """
+    root = _parse_part(data, limits, editable=False)
+    word = _TRANSITIONAL_BASE + "wordprocessingml/2006/main"
+    changed = False
+    replacements = {
+        "start": "left",
+        "end": "right",
+        "startChars": "leftChars",
+        "endChars": "rightChars",
+    }
+    directional = any(
+        node.tag in {Q(word, "start"), Q(word, "end")}
+        or any(Q(word, name) in node.attrib for name in replacements)
+        for node in root.iter()
+    )
+    if directional and any(
+        node.tag == Q(word, "bidi")
+        and node.get(Q(word, "val"), "true").lower() not in {"0", "false", "off"}
+        for node in root.iter()
+    ):
+        raise SaveOptionsError("ooxml_2006_bidi_direction_unsupported")
+    for node in root.iter():
+        namespace, _, name = str(node.tag).removeprefix("{").partition("}")
+        if namespace.startswith("http://schemas.microsoft.com/office/word/"):
+            raise SaveOptionsError("ooxml_2006_extension_unsupported")
+        if namespace == "http://schemas.openxmlformats.org/markup-compatibility/2006":
+            raise SaveOptionsError("ooxml_2006_markup_compatibility_unsupported")
+        if any(key.startswith("{http://schemas.microsoft.com/office/word/") for key in node.attrib):
+            raise SaveOptionsError("ooxml_2006_extension_unsupported")
+        if any(
+            key.startswith("{http://schemas.openxmlformats.org/markup-compatibility/2006}")
+            for key in node.attrib
+        ):
+            raise SaveOptionsError("ooxml_2006_markup_compatibility_unsupported")
+        if namespace != word:
+            continue
+        if node.tag == Q(word, "document") and Q(word, "conformance") in node.attrib:
+            del node.attrib[Q(word, "conformance")]
+            changed = True
+        if name in {"ind", "tblCellMar", "tcMar"}:
+            for old, new in replacements.items():
+                key = Q(word, old)
+                if key in node.attrib:
+                    if Q(word, new) in node.attrib:
+                        raise SaveOptionsError("ooxml_2006_direction_property_conflict")
+                    node.set(Q(word, new), node.attrib.pop(key))
+                    changed = True
+        if name in {"jc", "tblJc"} and node.get(Q(word, "val")) in {"start", "end"}:
+            raise SaveOptionsError("ooxml_2006_contextual_alignment_unsupported")
+        if name in {"tblBorders", "tcBorders", "tblCellMar", "tcMar"}:
+            for child in node:
+                local = child.tag.removeprefix("{" + word + "}")
+                if local in {"start", "end"}:
+                    target = Q(word, replacements[local])
+                    if node.find(target) is not None:
+                        raise SaveOptionsError("ooxml_2006_direction_property_conflict")
+                    child.tag = target
+                    changed = True
+    if not changed:
+        return data
+    from ..inspect import serialize_xml_with_preserved_qnames
+
+    return serialize_xml_with_preserved_qnames(root)
 
 
+def _legacy_control_ooxml(data: bytes, limits: PackageLimits) -> bytes:
+    """Represent XML-safe embedded text controls as WordprocessingML run nodes."""
+    root = _parse_part(data, limits, editable=False)
+    changed = False
+    words = {
+        _TRANSITIONAL_BASE + "wordprocessingml/2006/main",
+        _STRICT_BASE + "wordprocessingml/main",
+    }
+    for run in root.iter():
+        namespace, _, name = str(run.tag).removeprefix("{").partition("}")
+        if namespace not in words or name != "r":
+            continue
+        children = []
+        for node in run:
+            if node.tag != Q(namespace, "t") or not any(c in (node.text or "") for c in "\t\n\r"):
+                children.append(node)
+                continue
+            changed = True
+            for segment in re.split(r"([\t\n\r])", node.text or ""):
+                if segment in {"\t", "\n", "\r"}:
+                    children.append(
+                        ET.Element(Q(namespace, {"\t": "tab", "\n": "br", "\r": "cr"}[segment]))
+                    )
+                elif segment:
+                    text = ET.Element(node.tag, dict(node.attrib))
+                    text.text = segment
+                    if segment.strip() != segment:
+                        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                    children.append(text)
+            if children:
+                children[-1].tail = node.tail
+        run[:] = children
+    if not changed:
+        return data
+    from ..inspect import serialize_xml_with_preserved_qnames
+
+    return serialize_xml_with_preserved_qnames(root)
 
 
+_SHAPE_TREE_NODES = frozenset({"wsp", "wgp", "grpSp", "wpc"})
+_DRAWING_IMAGE_NODES = frozenset({"pic", "blip", "chart", "relIds", "contentPart", "graphicFrame"})
+_VML_IMAGE_NODES = frozenset({"imagedata", "OLEObject", "ink", "signatureline", "binData"})
+_RELATIONSHIP_ATTRIBUTES = frozenset({"id", "embed", "link", "pict"})
+_TRUE_VML = frozenset({"t", "true", "1", "on"})
 
+
+def _shape_text(node: ET.Element) -> list[ET.Element | str]:
+    """Text of one selected ``w:drawing`` or ``w:pict`` as stories in reading order.
+
+    A story is a ``w:txbxContent`` element (DrawingML text box or WordArt, VML text
+    box) or a string of newline-separated lines (an active VML ``v:textpath``
+    WordArt). The caller has already chosen one Markup Compatibility branch, so no
+    alternative representation is read twice. A DrawingML ``wps:linkedTxbx``
+    continuation owns no story: the chain's text lives once in its head. Anything
+    outside a story that carries an image, chart, diagram, ink or embedded object,
+    and any drawing with no text box or WordArt at all, is refused with
+    ``text_content_unsupported``. Nested drawings inside a story belong to that
+    story's own paragraphs and are not visited here.
+    """
+
+    def local(item: ET.Element) -> str:
+        return item.tag.rpartition("}")[2] if isinstance(item.tag, str) else ""
+
+    drawing = local(node) == "drawing"
+    stories: list[ET.Element | str] = []
+    bearing = False
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        name = local(item)
+        if drawing:
+            unsupported = name in _DRAWING_IMAGE_NODES or (
+                name == "graphicData"
+                and any(local(child) not in _SHAPE_TREE_NODES for child in item)
+            )
+        else:
+            unsupported = name in _VML_IMAGE_NODES or any(
+                key.rpartition("}")[2] == "relid"
+                or (
+                    key.partition("}")[0].endswith("/relationships")
+                    and key.rpartition("}")[2] in _RELATIONSHIP_ATTRIBUTES
+                )
+                for key in item.attrib
+            )
+        if unsupported:
+            raise SaveOptionsError("text_content_unsupported")
+        if name == ("txbx" if drawing else "textbox"):
+            bearing = True
+            stories.extend(child for child in item if local(child) == "txbxContent")
+        elif drawing and name == "linkedTxbx":
+            bearing = True
+        elif not drawing and name == "textpath":
+            if item.get("on", "f").lower() in _TRUE_VML:
+                bearing = True
+                stories.append(item.get("string", "").replace("\r\n", "\n").replace("\r", "\n"))
+        if name != "txbxContent":
+            stack.extend(reversed(item))
+    if not bearing:
+        raise SaveOptionsError("text_content_unsupported")
+    return stories
+
+
+def _save_text(graph: PackageGraph, options: TxtSaveOptions) -> str:
+    _feature_html_export = feature_module("html_export")
+    _MarkupCompatibilitySelection = _feature_html_export._MarkupCompatibilitySelection
+    _MathML = _feature_html_export._MathML
+    ExportStyles = _feature_html_export._Styles
+    _mathml_text = feature_module("markdown")._mathml_text
+    _feature_native_layout = feature_module("native_layout")
+    _Numbering = _feature_native_layout._Numbering
+    _Styles = _feature_native_layout._Styles
+
+    styles = _Styles(graph)
+    numbering = _Numbering(graph, styles)
+    math_styles = ExportStyles(graph)
+    counters: dict[int, dict[int, int]] = {}
+    field_state = _FieldTextState("text_field_structure_invalid", SaveOptionsError)
+    shapes: list[str] = []
+
+    def local(node: ET.Element) -> str:
+        return node.tag.rpartition("}")[2] if isinstance(node.tag, str) else ""
+
+    def inline(node: ET.Element, *, hidden: bool = False) -> str:
+        name = local(node)
+        if name in {"pPr", "rPr", "del", "moveFrom", "instrText", "delInstrText"}:
+            return ""
+        if name == "fldChar":
+            field_state.marker(node)
+            return ""
+        if name == "r":
+            namespace = node.tag[1:].partition("}")[0]
+            properties = node.find(Q(namespace, "rPr"))
+            hidden = hidden or (
+                properties is not None
+                and any(
+                    local(flag) in {"vanish", "webHidden"}
+                    and flag.get(Q(namespace, "val"), "true").lower() not in {"0", "false", "off"}
+                    for flag in properties
+                )
+            )
+        if name in {"oMath", "oMathPara"}:
+            if hidden or not field_state.visible:
+                return ""
+            namespace = node.tag[1:].partition("}")[0]
+            converter = _MathML(namespace, math_styles, {})
+            math = ET.fromstring(converter.argument(node))
+            if options.office_math_mode == TxtOfficeMathExportMode.LINEAR:
+                return _mathml_text(math)
+            return "".join(math.itertext())
+        if name in {"t", "tab", "br", "cr", "drawing", "pict", "object", "altChunk"}:
+            if hidden or not field_state.visible:
+                return ""
+            if name == "t":
+                return node.text or ""
+            if name == "tab":
+                return "\t"
+            if name in {"br", "cr"}:
+                kind = next((v for k, v in node.attrib.items() if k.endswith("}type")), "")
+                return ("\f" if options.export_page_breaks else "") if kind == "page" else "\n"
+            if name in {"drawing", "pict"}:
+                for item in _shape_text(node):
+                    chunk = item.split("\n") if isinstance(item, str) else story(item)
+                    if any(chunk):
+                        shapes.extend(chunk)
+                return ""
+            raise SaveOptionsError("text_content_unsupported")
+        return "".join(inline(child, hidden=hidden) for child in node)
+
+    def paragraph(node: ET.Element) -> list[str]:
+        nonlocal shapes
+        outer, shapes = shapes, []
+        properties = styles.paragraph_properties(
+            next((child for child in node if local(child) == "pPr"), None)
+        )
+        inherited = dict(styles.default_paragraph)
+        if style_id := properties.get("pstyle"):
+            inherited.update(styles.paragraph_style(style_id)[0])
+        inherited.update(properties)
+        prefix = ""
+        if inherited.get("num_pr") and not inherited.get("num_off"):
+            identifier = inherited.get("num_id")
+            if not isinstance(identifier, int):
+                raise SaveOptionsError("text_numbering_unsupported")
+            index = inherited.get("num_ilvl", 0)
+            level = numbering.level(identifier, index)
+            values = counters.setdefault(identifier, {})
+            values[index] = values.get(index, level.start - 1) + 1
+            for deeper in tuple(values):
+                if deeper > index:
+                    restart = numbering.level(identifier, deeper).restart
+                    if restart != 0 and (restart is None or restart - 1 <= index):
+                        del values[deeper]
+            prefix = options.list_indentation.character * (options.list_indentation.count * index)
+            if options.export_list_labels:
+                prefix += numbering.marker_text(identifier, level, values)
+                prefix += {"tab": "\t", "space": " ", "nothing": ""}[level.suffix]
+        page = "\f" if options.export_page_breaks and inherited.get("page_break_before") else ""
+        text = page + prefix + inline(node)
+        anchored, shapes = shapes, outer
+        return [text, *anchored]
+
+    def blocks(node: ET.Element) -> list[str]:
+        result: list[str] = []
+        for child in node:
+            name = local(child)
+            if name == "p":
+                result.extend(paragraph(child))
+            elif name == "tbl" and options.export_tables:
+                for row in child:
+                    if local(row) == "tr":
+                        result.append(
+                            options.table_cell_separator.join(
+                                options.paragraph_break.join(blocks(cell))
+                                for cell in row
+                                if local(cell) == "tc"
+                            )
+                        )
+            elif name not in {"tbl", "sectPr", "pPr", "rPr", "del", "moveFrom"}:
+                result.extend(blocks(child))
+        return result
+
+    def story_blocks(node: ET.Element) -> list[str]:
+        nonlocal field_state
+        field_state = _FieldTextState("text_field_structure_invalid", SaveOptionsError)
+        result = blocks(node)
+        field_state.finish()
+        return result
+
+    def story(content: ET.Element) -> list[str]:
+        """One shape story with field state of its own; the host's is untouched."""
+        nonlocal field_state
+        outer = field_state
+        field_state = _FieldTextState("text_field_structure_invalid", SaveOptionsError)
+        try:
+            result = blocks(content)
+            field_state.finish()
+        finally:
+            field_state = outer
+        return result
+
+    def part_root(part: str) -> ET.Element:
+        data = graph.read_part_bytes(part)
+        root = _parse_part(data, graph.limits, editable=False)
+        _MarkupCompatibilitySelection(data, root).select(root)
+        return root
+
+    main = part_root(_main_part(graph))
+    body = next((child for child in main if local(child) == "body"), None)
+    if body is None:
+        raise SaveOptionsError("text_document_body_missing")
+    headers: list[str] = []
+    footers: list[str] = []
+    if options.header_footer_mode != TxtExportHeadersFootersMode.NONE:
+        relationships = {rel.id: rel for rel in graph.relationships_for(_main_part(graph))}
+        seen: set[str] = set()
+        for reference in main.iter():
+            kind = local(reference)
+            if kind not in {"headerReference", "footerReference"}:
+                continue
+            variant = next((v for k, v in reference.attrib.items() if k.endswith("}type")), "")
+            if (
+                options.header_footer_mode == TxtExportHeadersFootersMode.PRIMARY_ONLY
+                and variant != "default"
+            ):
+                continue
+            identifier = next((v for k, v in reference.attrib.items() if k.endswith("}id")), "")
+            rel = relationships.get(identifier)
+            if rel is None or rel.is_external:
+                raise SaveOptionsError("text_story_relationship_invalid")
+            target = rel.resolved_target()
+            if target in seen:
+                continue
+            seen.add(target)
+            root = part_root(target)
+            (headers if kind == "headerReference" else footers).extend(story_blocks(root))
+    values = headers + story_blocks(body) + footers
+    return options.paragraph_break.join(values) + (options.paragraph_break if values else "")
+
+
+_TOC_INSTRUCTION = 'TOC \\o "1-3" \\h \\z \\u'
+
+
+def _paragraph_target(
+    records: Sequence[Mapping[str, Any]], paragraph: int, part: str = _DOCUMENT
+) -> Mapping[str, Any]:
+    """The discovered record of one paragraph target, or an empty one that binds nothing."""
+    return next(
+        (
+            record
+            for record in records
+            if record.get("paragraph") == paragraph and record.get("part", part) == part
+        ),
+        {},
+    )
+
+
+def _span(
+    target: Mapping[str, Any], start: int | None, end: int | None, expected: str | None
+) -> tuple[int, int, str]:
+    """A visible-text range of a discovered paragraph and the text it must still hold.
+
+    ``start`` defaults to the paragraph start and ``end`` to its end; ``expected``
+    defaults to the session's current text of the range.
+    """
+    text: str = target.get("text", "")
+    begin = 0 if start is None else start
+    stop = len(text) if end is None else end
+    return begin, stop, text[begin:stop] if expected is None else expected
+
+
+class RichObjectEdits(EditHost):
+    """Comments, notes, bookmarks, hyperlinks, fields, content controls, watermarks, and
+    text boxes, each through its file-to-file operation module.
+
+    ``paragraph`` is the 1-based paragraph index that module's own discovery reports
+    for ``part``. Every guard the module binds (the structure fingerprint, the text a
+    range must still hold, an existing comment's fingerprint) is read from the
+    session's current package; ``expected_old_text`` may be passed as an extra guard.
+    """
+
+    # -- comments -------------------------------------------------------------
+
+    def insert_comment(
+        self,
+        paragraph: int,
+        start: int,
+        end: int,
+        text: str,
+        *,
+        author: str,
+        date: str,
+        initials: str | None = None,
+        expected_old_text: str | None = None,
+        part: str = _DOCUMENT,
+    ) -> SessionEditReport:
+        """Anchor a new comment to visible characters ``[start, end)`` of ``paragraph``.
+
+        ``date`` is an ISO 8601 timestamp with a time zone. The report's ``detail``
+        lists every comment with its ``comment_id`` and ``comment_sha256``.
+        """
+        _feature_comments = feature_module("comments")
+        CommentInsert = _feature_comments.CommentInsert
+        CommentRequest = _feature_comments.CommentRequest
+        author_comment = _feature_comments.author_comment
+        discover_comment_targets = _feature_comments.discover_comment_targets
+
+        def build(staged: Staged) -> CommentRequest:
+            discovered = discover_comment_targets(staged.source, part=part)
+            target = _paragraph_target(discovered.get("targets", []), paragraph, part)
+            begin, stop, old = _span(target, start, end, expected_old_text)
+            return CommentRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                edits=(
+                    CommentInsert(
+                        part=part,
+                        paragraph=paragraph,
+                        start=begin,
+                        end=stop,
+                        expected_old_text=old,
+                        structure_fingerprint_sha256=bound_fingerprint(
+                            target.get("structure_fingerprint_sha256")
+                        ),
+                        author=author,
+                        initials=initials,
+                        date=date,
+                        text=text,
+                    ),
+                ),
+            )
+
+        return self._apply_operation("comment", build, author_comment)
+
+    def reply_to_comment(
+        self,
+        comment_id: int,
+        text: str,
+        *,
+        author: str,
+        date: str,
+        initials: str | None = None,
+    ) -> SessionEditReport:
+        """Append a reply to the thread of the existing comment ``comment_id``."""
+        from .._comment_threads import CommentReply
+
+        _feature_comments = feature_module("comments")
+        CommentRequest = _feature_comments.CommentRequest
+        author_comment = _feature_comments.author_comment
+        discover_comment_targets = _feature_comments.discover_comment_targets
+
+        def build(staged: Staged) -> CommentRequest:
+            comments = discover_comment_targets(staged.source).get("comments", [])
+            parent: Mapping[str, Any] = next(
+                (c for c in comments if c.get("comment_id") == comment_id), {}
+            )
+            return CommentRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                edits=(
+                    CommentReply(
+                        comment_id=comment_id,
+                        comment_sha256=bound_fingerprint(parent.get("comment_sha256")),
+                        author=author,
+                        initials=initials,
+                        date=date,
+                        text=text,
+                    ),
+                ),
+            )
+
+        return self._apply_operation("comment", build, author_comment)
+
+    # -- footnotes and endnotes -------------------------------------------------
+
+    def insert_footnote(
+        self,
+        paragraph: int,
+        text: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        anchor_boundary: str = "after",
+        expected_old_text: str | None = None,
+        custom_mark: str | None = None,
+    ) -> SessionEditReport:
+        """Insert a footnote whose reference sits at ``anchor_boundary`` of the range
+        ``[start, end)`` of body ``paragraph`` (by default the end of the paragraph)."""
+        return self._note(
+            "footnote",
+            paragraph,
+            text,
+            start,
+            end,
+            anchor_boundary,
+            expected_old_text,
+            custom_mark,
+        )
+
+    def insert_endnote(
+        self,
+        paragraph: int,
+        text: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        anchor_boundary: str = "after",
+        expected_old_text: str | None = None,
+        custom_mark: str | None = None,
+    ) -> SessionEditReport:
+        """Insert an endnote, addressed as :meth:`insert_footnote` addresses a footnote."""
+        return self._note(
+            "endnote",
+            paragraph,
+            text,
+            start,
+            end,
+            anchor_boundary,
+            expected_old_text,
+            custom_mark,
+        )
+
+    def _note(
+        self,
+        kind: str,
+        paragraph: int,
+        text: str,
+        start: int | None,
+        end: int | None,
+        anchor_boundary: str,
+        expected_old_text: str | None,
+        custom_mark: str | None,
+    ) -> SessionEditReport:
+        _feature_notes = feature_module("notes")
+        NoteRequest = _feature_notes.NoteRequest
+        author_note = _feature_notes.author_note
+        discover_note_targets = _feature_notes.discover_note_targets
+
+        def build(staged: Staged) -> NoteRequest:
+            discovered = discover_note_targets(staged.source, kind)
+            target = _paragraph_target(discovered.get("targets", []), paragraph)
+            begin, stop, old = _span(target, start, end, expected_old_text)
+            return NoteRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                kind=kind,
+                paragraph=paragraph,
+                start=begin,
+                end=stop,
+                expected_old_text=old,
+                structure_fingerprint_sha256=bound_fingerprint(
+                    target.get("structure_fingerprint_sha256")
+                ),
+                text=text,
+                anchor_boundary=anchor_boundary,
+                custom_mark=custom_mark,
+            )
+
+        return self._apply_operation("note", build, author_note)
+
+    # -- bookmarks and hyperlinks -----------------------------------------------
+
+    def insert_bookmark(
+        self,
+        name: str,
+        paragraph: int,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        expected_old_text: str | None = None,
+    ) -> SessionEditReport:
+        """Bookmark visible characters ``[start, end)`` of body ``paragraph`` (by default
+        the whole paragraph) as ``name``."""
+        _feature_bookmarks = feature_module("bookmarks")
+        BookmarkInsert = _feature_bookmarks.BookmarkInsert
+        BookmarkRequest = _feature_bookmarks.BookmarkRequest
+        author_bookmark = _feature_bookmarks.author_bookmark
+        discover_bookmark_targets = _feature_bookmarks.discover_bookmark_targets
+
+        def build(staged: Staged) -> BookmarkRequest:
+            discovered = discover_bookmark_targets(staged.source)
+            target = _paragraph_target(discovered.get("targets", []), paragraph)
+            begin, stop, old = _span(target, start, end, expected_old_text)
+            return BookmarkRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                edits=(
+                    BookmarkInsert(
+                        name=name,
+                        part=_DOCUMENT,
+                        paragraph=paragraph,
+                        start=begin,
+                        end=stop,
+                        expected_old_text=old,
+                        structure_fingerprint_sha256=bound_fingerprint(
+                            target.get("structure_fingerprint_sha256")
+                        ),
+                    ),
+                ),
+            )
+
+        return self._apply_operation("bookmark", build, author_bookmark)
+
+    def insert_hyperlink(
+        self,
+        paragraph: int,
+        start: int,
+        end: int,
+        target: str,
+        *,
+        kind: str | None = None,
+        tooltip: str | None = None,
+        expected_old_text: str | None = None,
+        part: str = _DOCUMENT,
+    ) -> SessionEditReport:
+        """Link visible characters ``[start, end)`` of ``paragraph`` to ``target``.
+
+        ``target`` is an allowlisted URL (an external link) or the name of one existing
+        bookmark (an internal link); ``kind`` (``"external"`` or ``"internal"``)
+        overrides the inference.
+        """
+        _feature_links = feature_module("links")
+        HyperlinkInsert = _feature_links.HyperlinkInsert
+        HyperlinkRequest = _feature_links.HyperlinkRequest
+        author_hyperlink = _feature_links.author_hyperlink
+        discover_hyperlink_targets = _feature_links.discover_hyperlink_targets
+
+        def build(staged: Staged) -> HyperlinkRequest:
+            discovered = discover_hyperlink_targets(staged.source, part=part)
+            record = _paragraph_target(discovered.get("targets", []), paragraph, part)
+            begin, stop, old = _span(record, start, end, expected_old_text)
+            return HyperlinkRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                edits=(
+                    HyperlinkInsert(
+                        paragraph=paragraph,
+                        start=begin,
+                        end=stop,
+                        expected_old_text=old,
+                        structure_fingerprint_sha256=bound_fingerprint(
+                            record.get("structure_fingerprint_sha256")
+                        ),
+                        target=target,
+                        part=part,
+                        kind=kind,
+                        tooltip=tooltip,
+                    ),
+                ),
+            )
+
+        return self._apply_operation("hyperlink", build, author_hyperlink)
+
+    # -- fields -------------------------------------------------------------------
+
+    def insert_field(
+        self,
+        paragraph: int,
+        instruction: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        result_text: str | None = None,
+        expected_old_text: str | None = None,
+        part: str = _DOCUMENT,
+    ) -> SessionEditReport:
+        """Insert one complex field with ``instruction`` into ``paragraph``.
+
+        The field replaces visible characters ``[start, end)``; by default it is
+        inserted, replacing nothing, at the end of the paragraph.
+        """
+        _feature_field_insert = feature_module("field_insert")
+        FieldInsertRequest = _feature_field_insert.FieldInsertRequest
+        discover_field_insert_targets = _feature_field_insert.discover_field_insert_targets
+        insert_field = _feature_field_insert.insert_field
+
+        def build(staged: Staged) -> FieldInsertRequest:
+            discovered = discover_field_insert_targets(staged.source, part=part)
+            target = _paragraph_target(discovered.get("targets", []), paragraph, part)
+            length = len(target.get("text", ""))
+            begin = length if start is None else start
+            stop = begin if end is None else end
+            begin, stop, old = _span(target, begin, stop, expected_old_text)
+            return FieldInsertRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                paragraph=paragraph,
+                start=begin,
+                end=stop,
+                expected_old_text=old,
+                structure_fingerprint_sha256=bound_fingerprint(
+                    target.get("structure_fingerprint_sha256")
+                ),
+                instruction=instruction,
+                part=part,
+                result_text=result_text,
+            )
+
+        return self._apply_operation("field-insert", build, insert_field)
+
+    def refresh_fields(
+        self,
+        *,
+        fonts: Sequence[Any] = (),
+        paragraph: int | None = None,
+        part: str = _DOCUMENT,
+        options: Any | None = None,
+        evaluation_time: str | None = None,
+        limits: Any | None = None,
+    ) -> SessionEditReport:
+        """Refresh the cached results of the fields of ``part``, or only those of
+        ``paragraph``, as :func:`~wolfdocx.fields.refresh_fields` would.
+
+        Page-dependent values (``PAGE``, ``NUMPAGES``, ``PAGEREF``, table-of-contents
+        page numbers) come from the engine's native pagination, laid out with ``fonts``.
+        """
+        _feature_fields = feature_module("fields")
+        FieldOptions = _feature_fields.FieldOptions
+        FieldRefreshRequest = _feature_fields.FieldRefreshRequest
+        FieldTarget = _feature_fields.FieldTarget
+        discover_field_targets = _feature_fields.discover_field_targets
+        refresh_fields = _feature_fields.refresh_fields
+        RenderLimits = feature_module("native_layout").RenderLimits
+
+        def build(staged: Staged) -> FieldRefreshRequest:
+            selected: tuple[FieldTarget, ...] = ()
+            if paragraph is not None:
+                inventory = discover_field_targets(staged.source, part=part).get("fields", [])
+                selected = tuple(
+                    FieldTarget(
+                        paragraph=entry["paragraph"],
+                        field=entry["field"],
+                        kind=entry["kind"] or "",
+                        instruction=entry["instruction"],
+                        structure_sha256=entry["structure_sha256"],
+                        part=part,
+                    )
+                    for entry in inventory
+                    if entry["paragraph"] == paragraph
+                ) or (
+                    # A paragraph without fields binds nothing, so the refresh refuses.
+                    FieldTarget(paragraph, 1, "", "", bound_fingerprint(None), part),
+                )
+            return FieldRefreshRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                output=staged.destination,
+                part=part,
+                fields=selected,
+                fonts=tuple(fonts),
+                limits=limits or RenderLimits(),
+                options=options or FieldOptions(),
+                evaluation_time=evaluation_time,
+            )
+
+        return self._apply_operation("field-refresh", build, refresh_fields)
+
+    def insert_table_of_contents(
+        self,
+        paragraph: int,
+        *,
+        fonts: Sequence[Any],
+        instruction: str = _TOC_INSTRUCTION,
+        position: str = "after",
+        limits: Any | None = None,
+    ) -> SessionEditReport:
+        """Insert a table of contents in a new body paragraph before or after
+        ``paragraph`` and refresh it against native pagination laid out with ``fonts``.
+
+        The three steps (an empty paragraph, the ``TOC`` field, its refresh) land
+        together or not at all.
+        """
+        toc = paragraph + 1 if position == "after" else paragraph
+        return self._apply_steps(
+            "table-of-contents",
+            (
+                lambda: self._edit_paragraph(
+                    paragraph, _DOCUMENT, action="insert", position=position, text=""
+                ),
+                lambda: self.insert_field(toc, instruction),
+                lambda: self.refresh_fields(fonts=fonts, paragraph=toc, limits=limits),
+            ),
+        )
+
+    # -- content controls, watermarks, text boxes --------------------------------
+
+    def insert_content_control(
+        self,
+        paragraph: int,
+        control: Any | None = None,
+    ) -> SessionEditReport:
+        """Wrap direct body ``paragraph`` in a block-level content control.
+
+        ``control`` defaults to a plain-text control with no tag or alias.
+        """
+        _feature_content_controls = feature_module("content_controls")
+        ContentControlRequest = _feature_content_controls.ContentControlRequest
+        ContentControlSpec = _feature_content_controls.ContentControlSpec
+        author_content_control = _feature_content_controls.author_content_control
+        content_control_structure_fingerprint = (
+            _feature_content_controls.content_control_structure_fingerprint
+        )
+
+        def build(staged: Staged) -> ContentControlRequest:
+            return ContentControlRequest(
+                source=staged.source,
+                destination=staged.destination,
+                source_sha256=staged.source_sha256,
+                target={"paragraph": paragraph, "part": _DOCUMENT},
+                structure_fingerprint_sha256=bound_fingerprint(
+                    content_control_structure_fingerprint(staged.source, paragraph=paragraph)
+                ),
+                control=ContentControlSpec() if control is None else control,
+            )
+
+        return self._apply_operation("content-control", build, author_content_control)
+
+    def add_text_watermark(
+        self, text: str, *, section: int = 1, variant: str = "default", **style: Any
+    ) -> SessionEditReport:
+        """Add a text watermark to the ``variant`` header of ``section``.
+
+        ``style`` takes the :class:`~wolfdocx.watermarks.TextWatermark` fields
+        (``color``, ``opacity``, ``rotation``, ``font_family``, ``font_size``, and
+        the rest). Without an ``identifier`` the module seeds one from the digest of
+        the session's current package, as it would from the file it reads.
+        """
+        _feature_watermarks = feature_module("watermarks")
+        TextWatermark = _feature_watermarks.TextWatermark
+        WatermarkRequest = _feature_watermarks.WatermarkRequest
+        add_text_watermark = _feature_watermarks.add_text_watermark
+
+        watermark = TextWatermark(text=text, **style)
+
+        def build(staged: Staged) -> WatermarkRequest:
+            return WatermarkRequest(
+                staged.source,
+                staged.source_sha256,
+                staged.destination,
+                section,
+                variant=variant,
+            )
+
+        return self._apply_operation(
+            "watermark", build, lambda request: add_text_watermark(request, watermark)
+        )
+
+    def insert_text_box(
+        self,
+        paragraph: int,
+        text: str,
+        *,
+        extent_cx: int,
+        extent_cy: int,
+        anchor: Any,
+        part: str = _DOCUMENT,
+        **style: Any,
+    ) -> SessionEditReport:
+        """Anchor a page-positioned text box holding ``text`` to ``paragraph``, sized
+        in EMU.
+
+        ``style`` takes the optional :class:`~wolfdocx.text_boxes.TextBoxInsertRequest`
+        fields (``font_face``, ``font_size``, ``bold``, ``fill``, ``border_color``,
+        ``name``, and the rest).
+        """
+        _feature_text_boxes = feature_module("text_boxes")
+        TextBoxInsertRequest = _feature_text_boxes.TextBoxInsertRequest
+        author_text_box_insert = _feature_text_boxes.author_text_box_insert
+        text_box_structure_fingerprint = _feature_text_boxes.text_box_structure_fingerprint
+
+        def build(staged: Staged) -> TextBoxInsertRequest:
+            return TextBoxInsertRequest(
+                source=staged.source,
+                source_sha256=staged.source_sha256,
+                destination=staged.destination,
+                paragraph=paragraph,
+                structure_fingerprint_sha256=bound_fingerprint(
+                    text_box_structure_fingerprint(staged.source, paragraph=paragraph, part=part)
+                ),
+                text=text,
+                extent_cx=extent_cx,
+                extent_cy=extent_cy,
+                anchor=anchor,
+                part=part,
+                **style,
+            )
+
+        return self._apply_operation("text-box", build, author_text_box_insert)
 
 
 class DocumentOperations(
     RunEdits,
     TableEdits,
+    PictureEdits,
     SectionEdits,
     ListEdits,
     StylingEdits,
+    RichObjectEdits,
 ):
-    """Apply in-memory edits and save a verified DOCX without clobbering files."""
+    """One DOCX package opened once and edited in memory until :meth:`save`.
+
+    Open paths or open, seekable binary streams; streams are read from the start,
+    remain caller-owned and are copied to a private disk snapshot. Closed,
+    non-seekable and read-failure inputs raise a named
+    :class:`~wolfdocx.package.PackageError`. Default admission validates the main
+    story and internal targets. For diagnostic callers, explicitly defer part
+    validation through :class:`~wolfdocx.load_options.LoadOptions`.
+    :meth:`append_paragraph`, :meth:`set_cell_text`, and :meth:`find_replace` return
+    the report types of the stateless APIs with status ``"applied"``; every other
+    edit returns a :class:`~wolfdocx.session_ops.SessionEditReport`. Nothing is
+    written until :meth:`save`, which may be called more than once.
+
+    :attr:`warnings` is cumulative diagnostic history until ``clear()``. Clearing
+    it changes neither package bytes nor load, save, or render receipts.
+    :meth:`render` renders current edits without publishing an intermediate DOCX.
+    """
 
     @property
     def warnings(self) -> WarningCollection:
-        """Save refusal diagnostics in operation order."""
+        """Load repairs, save refusals and render diagnostics in operation order."""
         if self._warnings is None:
             from ..render_warnings import WarningCollection
 
             self._warnings = WarningCollection()
         return self._warnings
 
-    
+    @property
+    def editing_language(self) -> str | None:
+        """The package's declared default language, else the load preference."""
+        return None if self.load_report is None else self.load_report.editing_language
 
-    
+    @property
+    def load_recovery(self) -> tuple[str, ...]:
+        """Every repair a best-effort load made; empty for a whole package."""
+        if self.load_report is None:
+            return ()
+        return tuple(str(action) for action in self.load_report.recovery)
 
     @property
     def part_names(self) -> tuple[str, ...]:
@@ -612,11 +1853,50 @@ class DocumentOperations(
             name for name in self._entries if name in self._graph.parts or name in self._changed
         )
 
-    
+    def _notify_load_report(self, report: LoadReport, previous: LoadReport | None) -> None:
+        from ..render_warnings import RenderWarning, WarningCategory, WarningSource
 
-    
+        old_actions = () if previous is None else previous.recovery
+        self.warnings._extend(
+            RenderWarning(
+                WarningCategory.RECOVERY,
+                WarningSource.LOAD,
+                str(action),
+                kind=action.code,
+                locator=action.target,
+                reason=action.code,
+            )
+            for action in report.recovery
+            if action not in old_actions
+        )
 
-    
+    def _apply_initial_load_options(self, load_options: LoadOptions) -> None:
+        if load_options is not None and (
+            self.load_report.editing_language_source == "preference"
+            or load_options.text_direction.value != "ltr"
+            or load_options.language_preferences is not None
+        ):
+            for name in self._entries:
+                if self._preference_story(name):
+                    before = self.part_bytes(name)
+                    after = self._with_load_preferences(name, before)
+                    if after != before:
+                        self._set_part(name, after)
+            if self._changed:
+                self._record("load-preferences", tuple(sorted(self._changed)))
+        if load_options is not None:
+            self._apply_shared_load_options(load_options)
+
+    @property
+    def web_add_ins(self) -> WebAddIns:
+        """Inspect and atomically edit local add-in metadata and task panes.
+
+        Import value records from :mod:`wolfdocx.web_extensions`; save through
+        this session. References are metadata only and are never fetched.
+        """
+        from ..web_extensions import WebAddIns
+
+        return WebAddIns(self)
 
     def insert_story(self, story: Node, *, section: int = 1, variant: str = "default") -> Node:
         """Install a detached header/footer clone into an unoccupied section slot.
@@ -1378,10 +2658,7 @@ class DocumentOperations(
                         )
                     elif any(item.tag == Q(ns, "bookmarkEnd") for item in incoming.iter()):
                         raise NodeEditError("node_bookmark_range_incomplete")
-                    from ..review import (
-                        _CONFLICT_REVISION_TAGS,
-                        _SELECTABLE_REVISION_TAGS,
-                    )
+                    from ..review import _CONFLICT_REVISION_TAGS, _SELECTABLE_REVISION_TAGS
 
                     revision_tags = {
                         Q(ns, tag) for tag in _SELECTABLE_REVISION_TAGS
@@ -2182,19 +3459,69 @@ class DocumentOperations(
 
     # -- publication ------------------------------------------------------------
 
-    def save(self, path: str | Path | BinaryIO) -> SessionSaveReport:
-        """Verify edits and save without replacing an existing destination."""
+    def save(
+        self, path: str | Path | BinaryIO, *, options: OoxmlSaveOptions | None = None
+    ) -> SessionSaveReport:
+        """Stage and verify privately before publishing to a path or binary stream.
+
+        An existing path is refused and never replaced. A stream must be empty and
+        seekable so a failed publication can be rolled back without losing caller data.
+        Caller progress exceptions propagate unchanged before publication.
+        """
         source = self._source()
         sink = path if hasattr(path, "write") else None
         destination = None if sink is not None else Path(path).resolve()
         display = "<stream>" if destination is None else str(destination)
         changed = dict(self._changed)
-    
+
         def refusal(code: str) -> SessionSaveReport:
             return self._record_save_report(
                 SessionSaveReport(_REFUSED, code, self.source_sha256, display)
             )
-    
+
+        callback_error: Exception | None = None
+
+        def progress(stage: str) -> None:
+            nonlocal callback_error
+            try:
+                assert options is not None
+                options._progress(stage)
+            except Exception as exc:
+                callback_error = exc
+                raise
+
+        if options is not None and not isinstance(options, OoxmlSaveOptions):
+            return refusal("ooxml_save_options_invalid")
+        if options is not None:
+            try:
+                options._validate_lifecycle()
+                progress("read")
+                if options.property_updates:
+                    updated = _apply_save_properties(self._materialize(), options.property_updates)
+                    selected = replace(
+                        options,
+                        property_updates=None,
+                        progress_callback=lambda stage: (
+                            progress(stage) if stage != "read" else None
+                        ),
+                    )
+                    with Document.from_bytes(
+                        updated, path=self.path, limits=self._graph.limits
+                    ) as snapshot:
+                        snapshot._signature_source_graph = self._signature_source_graph
+                        report = snapshot.save(path, options=selected)
+                    self._record_save_report(report)
+                    return replace(
+                        report,
+                        source_sha256=self.source_sha256,
+                        edits=tuple(self._edits),
+                        load_recovery=self.load_recovery,
+                    )
+            except SaveOptionsError as exc:
+                if exc is callback_error:
+                    raise
+                return refusal(exc.code)
+
         if sink is not None:
             try:
                 if not sink.seekable() or sink.tell() != 0 or sink.seek(0, 2) != 0:
@@ -2208,32 +3535,92 @@ class DocumentOperations(
                 return refusal("document_destination_exists")
             if not destination.parent.is_dir():
                 return refusal("document_destination_invalid")
-            if (destination.suffix.lower() == ".docx"
+            if (
+                destination.suffix.lower() == ".docx"
                 and self._graph.parts[_main_part(self._graph)].content_type
-                in _MACRO_MAIN_CONTENT_TYPES):
+                in _MACRO_MAIN_CONTENT_TYPES
+            ):
                 return refusal("document_destination_extension_mismatch")
         removed = tuple(sorted(self._infos.keys() - self._entries.keys()))
         structural = {name for name in changed if _structural(name)}
         staged: Path | None = None
         try:
+            if options is not None:
+                progress("render")
             with tempfile.NamedTemporaryFile(
                 dir=None if destination is None else destination.parent,
                 prefix="wolfdocx-save-" if destination is None else f".{destination.name}.",
-                suffix=".tmp", delete=False,
+                suffix=".tmp",
+                delete=False,
             ) as stream:
                 staged = Path(stream.name)
                 self._write_to(stream, source, changed)
-            verified = _verify_staged_changes(
-                staged,
-                {name: data for name, data in changed.items() if name not in structural},
-                limits=self._graph.limits,
-                unchanged_identical=lambda graph: self._unchanged_raw(graph, staged, changed),
-                unchanged_elements=0, baseline_tree=self._current_tree, parsed=self._checked,
-                check_notes=bool(changed.keys() & self._note_parts()) or bool(removed),
-            )
+            if not changed and not removed:
+                # Exact-byte identity reuses admission, including opaque parts and
+                # ZIP metadata. Do not parse an already admitted package again.
+                digest = sha256_file(staged)
+                verified = (digest, {}) if digest == self.source_sha256 else None
+            else:
+                verified = _verify_staged_changes(
+                    staged,
+                    {name: data for name, data in changed.items() if name not in structural},
+                    limits=self._graph.limits,
+                    unchanged_identical=lambda graph: self._unchanged_raw(graph, staged, changed),
+                    unchanged_elements=0,
+                    baseline_tree=self._current_tree,
+                    parsed=self._checked,
+                    check_notes=bool(changed.keys() & self._note_parts()) or bool(removed),
+                )
             if verified is None:
                 return refusal("document_staged_verification_failed")
             output_sha256 = verified[0]
+            raw_copied_parts = len(self.part_names) - len(changed)
+            if options is not None:
+                original = staged.read_bytes()
+                converted = _save_ooxml(original, options, self._graph.limits)
+                if converted is not original:
+                    raw_copied_parts = 0
+                    output_sha256 = sha256_bytes(converted)
+                    staged.write_bytes(converted)
+                if options.signing_details is not None:
+                    _feature_package_signatures = feature_module("package_signatures")
+                    DocxSignatureRequest = _feature_package_signatures.DocxSignatureRequest
+                    sign_docx = _feature_package_signatures.sign_docx
+
+                    details = dict(options.signing_details)
+                    if details.get("signing_time") is None:
+                        raise SaveOptionsError("ooxml_signing_time_required")
+                    signed = staged.with_suffix(".signed.docx")
+                    try:
+                        report = sign_docx(
+                            DocxSignatureRequest(
+                                staged,
+                                signed,
+                                output_sha256,
+                                certificate=Path(details.pop("certificate")),
+                                private_key=Path(details.pop("private_key")),
+                                private_key_password_env=details.pop(
+                                    "private_key_password_env", None
+                                ),
+                                **details,
+                            )
+                        )
+                        if report.status != "published":
+                            raise SaveOptionsError(report.code or "ooxml_signing_failed")
+                        staged.write_bytes(signed.read_bytes())
+                        output_sha256 = report.destination_sha256
+                    finally:
+                        signed.unlink(missing_ok=True)
+                progress("publish")
+            signature_source = self._signature_source_graph
+            invalidated_signatures: tuple[str, ...] = ()
+            if any(
+                part.content_type == _SIGNATURE_CONTENT_TYPE
+                for part in signature_source.parts.values()
+            ):
+                invalidated_signatures = feature_module(
+                    "package_signatures"
+                )._invalidated_signatures(signature_source, staged)
             if sink is not None:
                 try:
                     with staged.open("rb") as stream:
@@ -2247,14 +3634,25 @@ class DocumentOperations(
                 linked = None
             else:
                 from ..review import _link_no_clobber
+
                 assert destination is not None
                 linked = _link_no_clobber(
-                    staged, destination, exists_code="document_destination_exists",
+                    staged,
+                    destination,
+                    exists_code="document_destination_exists",
                     unavailable_code="document_publication_unavailable",
                 )
-        except OSError:
+        except SaveOptionsError as exc:
+            if exc is callback_error:
+                raise
+            return refusal(str(exc))
+        except OSError as exc:
+            if exc is callback_error:
+                raise
             return refusal("document_publication_unavailable")
-        except (ValueError, zipfile.BadZipFile, struct.error) + _PART_ERRORS:
+        except (ValueError, zipfile.BadZipFile, struct.error) + _PART_ERRORS as exc:
+            if exc is callback_error:
+                raise
             return refusal("document_staged_verification_failed")
         finally:
             if staged is not None:
@@ -2262,15 +3660,71 @@ class DocumentOperations(
         if linked is not None:
             return refusal(linked)
         return SessionSaveReport(
-            _PUBLISHED, None, self.source_sha256, display,
+            _PUBLISHED,
+            None,
+            self.source_sha256,
+            display,
             destination_sha256=output_sha256,
             changed_parts=tuple(sorted(name for name in changed if name in self._infos)),
             added_parts=tuple(sorted(name for name in changed if name not in self._infos)),
-            removed_parts=removed, raw_copied_parts=len(self.part_names) - len(changed),
+            removed_parts=removed,
+            raw_copied_parts=raw_copied_parts,
             edits=tuple(self._edits),
+            load_recovery=self.load_recovery,
+            invalidated_signatures=invalidated_signatures,
         )
 
-    
+    def save_text(
+        self, path: str | Path | BinaryIO, *, options: TxtSaveOptions | None = None
+    ) -> SessionSaveReport:
+        """Export with the same full TXT policy as ``TxtSaveOptions.save``.
+
+        Refusals retain the session's original source identity; existing paths
+        and caller-owned streams are never clobbered.
+        Caller progress exceptions propagate unchanged before publication.
+        """
+        self._source()
+        selected = TxtSaveOptions() if options is None else options
+        display = "<stream>" if hasattr(path, "write") else str(Path(path).resolve())
+        if not isinstance(selected, TxtSaveOptions):
+            return self._record_save_report(
+                SessionSaveReport(
+                    _REFUSED,
+                    "text_save_options_invalid",
+                    self.source_sha256,
+                    display,
+                    content_type="text/plain",
+                    written_format="txt",
+                )
+            )
+        callback_error: Exception | None = None
+        callback = selected.progress_callback
+        if callback is not None:
+
+            def progress(stage: str) -> None:
+                nonlocal callback_error
+                try:
+                    callback(stage)
+                except Exception as exc:
+                    callback_error = exc
+                    raise
+
+            selected = replace(selected, progress_callback=progress)
+        try:
+            return self._record_save_report(selected.save(self, path))
+        except SaveOptionsError as exc:
+            if exc is callback_error:
+                raise
+            return self._record_save_report(
+                SessionSaveReport(
+                    _REFUSED,
+                    exc.code,
+                    self.source_sha256,
+                    display,
+                    content_type="text/plain",
+                    written_format="txt",
+                )
+            )
 
     def _record_save_report(self, report: SessionSaveReport) -> SessionSaveReport:
         if report.code is not None:
@@ -2291,7 +3745,83 @@ class DocumentOperations(
             )
         return report
 
-    
+    def render(
+        self,
+        output_dir: str | Path,
+        *,
+        formats: Sequence[str] = ("pdf",),
+        fonts: Sequence[Any] = (),
+        scale: float = 1.0,
+        limits: Any | None = None,
+        **options: Any,
+    ) -> Any:
+        """Render current edits with native request options and retain diagnostics.
+
+        ``options`` names the optional fields of
+        :class:`~wolfdocx.native_render.NativeRenderRequest`, including font
+        sources, substitution rules and save policy. Source bytes and their
+        digest are bound to this session's current package. Existing render
+        destinations and unsupported capabilities keep the native typed refusal.
+        Font discovery callbacks still receive their original diagnostic records;
+        callback exceptions propagate unchanged.
+        """
+        from ..render_warnings import font_discovery_warning, warnings_from_native_report
+
+        FontSettings = feature_module("font_sources").FontSettings
+        RenderLimits = feature_module("native_layout").RenderLimits
+        _feature_native_render = feature_module("native_render")
+        NativeRenderRequest = _feature_native_render.NativeRenderRequest
+        render_native = _feature_native_render.render_native
+
+        callback = options.pop("font_warning_callback", None)
+        preferences = self._load_preferences
+        if preferences is not None and preferences.font_settings is not None:
+            options.setdefault("font_settings", preferences.font_settings)
+        settings = options.get("font_settings")
+        if isinstance(settings, FontSettings):
+            callback = settings.warning_callback
+
+        def font_warning(record: dict[str, str]) -> None:
+            warning = font_discovery_warning(record)
+            self.warnings._extend((warning,))
+            if preferences is not None and preferences.warning_callback is not None:
+                preferences.warning_callback(warning)
+            if callback is not None:
+                callback(record)
+
+        # Native validation still sees non-callable callbacks and refuses them.
+        # Settings take precedence over direct options; copy only the callback
+        # field so reusable caller policy is never mutated.
+        selected_callback = font_warning if callback is None or callable(callback) else callback
+        if isinstance(settings, FontSettings):
+            options["font_settings"] = replace(settings, warning_callback=selected_callback)
+
+        with tempfile.TemporaryDirectory(
+            prefix="wolfdocx-session-render-",
+            dir=None if preferences is None else preferences.temp_folder,
+        ) as staging:
+            source = Path(staging) / "document.docx"
+            with source.open("wb") as stream:
+                self._write_to(stream, self._source(), self._changed)
+            report = render_native(
+                NativeRenderRequest(
+                    source=source,
+                    source_sha256=sha256_file(source),
+                    output_dir=Path(output_dir),
+                    fonts=tuple(fonts),
+                    formats=tuple(formats),
+                    scale=scale,
+                    limits=RenderLimits() if limits is None else limits,
+                    font_warning_callback=selected_callback,
+                    **options,
+                )
+            )
+        warnings = warnings_from_native_report(report)
+        self.warnings._extend(warnings)
+        if preferences is not None and preferences.warning_callback is not None:
+            for warning in warnings:
+                preferences.warning_callback(warning)
+        return report
 
     # -- internals --------------------------------------------------------------
 
@@ -2324,20 +3854,326 @@ class DocumentOperations(
         del self._trees[name]
         return loaded
 
-    
+    def _preference_story(self, name: str, graph: PackageGraph | None = None) -> bool:
+        from ..load_options import _MAIN_CONTENT_TYPES, _WML
 
-    
+        part = (graph or self._graph).parts.get(name)
+        return part is not None and (
+            part.content_type in _MAIN_CONTENT_TYPES
+            or part.content_type
+            in {
+                f"{_WML}.{kind}+xml"
+                for kind in ("header", "footer", "footnotes", "endnotes", "comments")
+            }
+        )
 
-    
+    def _with_load_preferences(
+        self, name: str, data: bytes, graph: PackageGraph | None = None
+    ) -> bytes:
+        """Fill absent story formatting in the overlay, never in the source graph."""
+        options = self._load_preferences
+        if options is None or not self._preference_story(name, graph):
+            return data
+        language = (
+            self.editing_language
+            if self.load_report.editing_language_source == "preference"
+            else None
+        )
+        script_preferences = options.language_preferences
+        if (
+            language is None
+            and options.text_direction.value == "ltr"
+            and script_preferences is None
+        ):
+            return data
+        from ..inspect import serialize_xml_with_preserved_qnames
+        from ..load_options import contains_right_to_left, first_strong_direction
+        from ..ooxml_order import _PPR_ORDER, _RPR_ORDER, _sort_children
+        from ..review import _word_namespace
 
-    
+        try:
+            root = self._parse(data, editable=True)
+            ns = _word_namespace(root)
+        except _PART_ERRORS as exc:
+            raise _load_refusal(
+                "load_preference_story_invalid", "Load preference story is invalid.", name
+            ) from exc
+        if ns is None:
+            raise _load_refusal(
+                "load_preference_story_unsupported", "Load preference story is unsupported.", name
+            )
+        changed = False
+        if language is not None or script_preferences is not None:
+            defaults = {}
+            if language is not None:
+                defaults[Q(ns, "val")] = language
+            if script_preferences is not None:
+                for attribute, value in (
+                    ("bidi", script_preferences.bidi),
+                    ("eastAsia", script_preferences.east_asia),
+                ):
+                    if value is not None:
+                        defaults[Q(ns, attribute)] = value
+            for run in root.iter(Q(ns, "r")):
+                properties = run.find(Q(ns, "rPr"))
+                if properties is None:
+                    properties = ET.Element(Q(ns, "rPr"))
+                    run.insert(0, properties)
+                node = properties.find(Q(ns, "lang"))
+                missing = (
+                    defaults
+                    if node is None
+                    else {key: value for key, value in defaults.items() if key not in node.attrib}
+                )
+                if missing:
+                    if node is None:
+                        node = ET.SubElement(properties, Q(ns, "lang"))
+                    node.attrib.update(missing)
+                    _sort_children(properties, _RPR_ORDER)
+                    changed = True
+        if options.text_direction.value != "ltr":
+            for paragraph in root.iter(Q(ns, "p")):
+                properties = paragraph.find(Q(ns, "pPr"))
+                if properties is None:
+                    properties = ET.Element(Q(ns, "pPr"))
+                    paragraph.insert(0, properties)
+                if properties.find(Q(ns, "bidi")) is None:
+                    rtl = (
+                        options.text_direction.value == "rtl"
+                        or first_strong_direction(
+                            "".join(node.text or "" for node in paragraph.iter(Q(ns, "t")))
+                        )
+                        == "rtl"
+                    )
+                    ET.SubElement(properties, Q(ns, "bidi"), {Q(ns, "val"): "1" if rtl else "0"})
+                    _sort_children(properties, _PPR_ORDER)
+                    changed = True
+            for run in root.iter(Q(ns, "r")):
+                text = "".join(node.text or "" for node in run.iter(Q(ns, "t")))
+                if not contains_right_to_left(text):
+                    continue
+                properties = run.find(Q(ns, "rPr"))
+                if properties is None:
+                    properties = ET.Element(Q(ns, "rPr"))
+                    run.insert(0, properties)
+                if properties.find(Q(ns, "rtl")) is None:
+                    ET.SubElement(properties, Q(ns, "rtl"), {Q(ns, "val"): "1"})
+                    _sort_children(properties, _RPR_ORDER)
+                    changed = True
+        return serialize_xml_with_preserved_qnames(root) if changed else data
 
-    
+    def _apply_shared_load_options(self, options: LoadOptions) -> None:
+        """Apply actual session transformations only for explicitly selected policies."""
+        if options.word_version is not None:
+            from ..load_options import _WORD_VERSIONS
+            from ..review import _word_namespace
 
-    
+            ns = _word_namespace(self._editable(_main_part(self._graph))[1])
+            assert ns is not None
+            part = self._definition_part("settings")
+            settings = (
+                ET.Element(Q(ns, "settings"))
+                if part is None
+                else copy.deepcopy(self._editable(part)[1])
+            )
+            compat = settings.find(Q(ns, "compat"))
+            if compat is None:
+                compat = ET.SubElement(settings, Q(ns, "compat"))
+            mode = next(
+                (
+                    node
+                    for node in compat.findall(Q(ns, "compatSetting"))
+                    if node.get(Q(ns, "name")) == "compatibilityMode"
+                ),
+                None,
+            )
+            if mode is None:
+                mode = ET.SubElement(compat, Q(ns, "compatSetting"))
+            mode.attrib.update(
+                {
+                    Q(ns, "name"): "compatibilityMode",
+                    Q(ns, "uri"): "http://schemas.microsoft.com/office/word",
+                    Q(ns, "val"): str(_WORD_VERSIONS[options.word_version]),
+                }
+            )
+            self._replace_definitions("settings", settings)
+        if options.shape_to_math:
+            self._load_shape_math()
+        if not options.preserve_include_picture:
+            self._load_unlink_pictures()
+        if options.update_dirty_fields:
+            self._load_dirty_fields(options)
+
+    def _load_shape_math(self) -> None:
+        """Promote native DrawingML equations without guessing from a picture's pixels."""
+        from ..inspect import serialize_xml_with_preserved_qnames
+        from ..review import _word_namespace
+
+        math_ns = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+        a14 = "http://schemas.microsoft.com/office/drawing/2010/main"
+        office = "urn:schemas-microsoft-com:office:office"
+        for name in tuple(self._entries):
+            if not self._preference_story(name):
+                continue
+            root = copy.deepcopy(self._editable(name)[1])
+            ns = _word_namespace(root)
+            assert ns is not None
+            parents = {child: parent for parent in root.iter() for child in parent}
+            converted = False
+            for run in list(root.iter(Q(ns, "r"))):
+                for shape in list(run):
+                    if shape.tag not in {Q(ns, "drawing"), Q(ns, "pict"), Q(ns, "object")}:
+                        continue
+                    equations = [
+                        equation
+                        for container in shape.iter(Q(a14, "m"))
+                        for equation in container
+                        if equation.tag == Q(math_ns, "oMath")
+                    ]
+                    if not equations:
+                        if any(
+                            node.get("ProgID", "").startswith(("Equation.", "MathType"))
+                            for node in shape.iter(Q(office, "OLEObject"))
+                        ):
+                            raise _load_refusal(
+                                "load_shape_math_unsupported",
+                                "An embedded binary equation cannot be converted.",
+                                name,
+                            )
+                        continue
+                    # A shape with other visible content is not safely replaceable.
+                    if any(
+                        node.tag.rpartition("}")[2] in {"blip", "imagedata"}
+                        for node in shape.iter()
+                    ):
+                        raise _load_refusal(
+                            "load_shape_math_mixed_content",
+                            "Equation shape also has image content.",
+                            name,
+                        )
+                    parent = parents.get(run)
+                    if parent is None:
+                        raise _load_refusal(
+                            "load_shape_math_context_unsupported",
+                            "Equation context is unsupported.",
+                            name,
+                        )
+                    position = list(parent).index(run)
+                    if len(run) != 1:
+                        raise _load_refusal(
+                            "load_shape_math_mixed_content", "Equation run has other content.", name
+                        )
+                    parent.remove(run)
+                    for offset, equation in enumerate(equations):
+                        parent.insert(position + offset, copy.deepcopy(equation))
+                    converted = True
+            if converted:
+                self._set_part(name, serialize_xml_with_preserved_qnames(root))
+                self._record("load-shape-math", (name,))
+
+    def _load_unlink_pictures(self) -> None:
+        """Retain cached INCLUDEPICTURE drawings while removing field instructions."""
+        from ..inspect import serialize_xml_with_preserved_qnames
+        from ..review import _word_namespace
+
+        field_nodes = feature_module("fields").field_nodes
+
+        for name in tuple(self._entries):
+            if not self._preference_story(name):
+                continue
+            root = copy.deepcopy(self._editable(name)[1])
+            ns = _word_namespace(root)
+            assert ns is not None
+            fields = [
+                entry
+                for entry in field_nodes(root, ns, part=name)
+                if entry.code == "INCLUDEPICTURE"
+            ]
+            if not fields:
+                continue
+            parents = {child: parent for parent in root.iter() for child in parent}
+            for entry in reversed(fields):
+                if entry.locked:
+                    continue
+                if entry.simple is not None:
+                    parent = parents[entry.simple]
+                    position = list(parent).index(entry.simple)
+                    parent.remove(entry.simple)
+                    for offset, child in enumerate(list(entry.simple)):
+                        parent.insert(position + offset, child)
+                else:
+                    for node in entry.nodes:
+                        parent = parents.get(node)
+                        if parent is not None and node in list(parent):
+                            parent.remove(node)
+            self._set_part(name, serialize_xml_with_preserved_qnames(root))
+            self._record("load-include-picture-unlink", (name,))
+
+    def _load_dirty_fields(self, options: LoadOptions) -> None:
+        """Refresh only dirty unlocked fields through the existing source-bound evaluator."""
+        _feature_fields = feature_module("fields")
+        FieldRefreshRequest = _feature_fields.FieldRefreshRequest
+        FieldTarget = _feature_fields.FieldTarget
+        discover_field_targets = _feature_fields.discover_field_targets
+        refresh_fields = _feature_fields.refresh_fields
+
+        for name in tuple(self._entries):
+            if not self._preference_story(name):
+                continue
+            with tempfile.TemporaryDirectory(
+                prefix="wolfdocx-load-fields-", dir=options.temp_folder
+            ) as scratch:
+                source = Path(scratch) / "source.docx"
+                output = Path(scratch) / "updated.docx"
+                current = self._materialize()
+                source.write_bytes(current)
+                inventory = discover_field_targets(source, part=name)
+                if inventory.get("status") == "refused":
+                    raise _load_refusal(
+                        inventory.get("code") or "load_dirty_fields_invalid",
+                        "Dirty field discovery failed.",
+                        name,
+                    )
+                selected = tuple(
+                    FieldTarget(
+                        entry["paragraph"],
+                        entry["field"],
+                        entry["kind"] or "",
+                        entry["instruction"],
+                        entry["structure_sha256"],
+                        name,
+                    )
+                    for entry in inventory.get("fields", [])
+                    if entry["dirty"] and not entry["fldLock"]
+                )
+                if not selected:
+                    continue
+                options.notify("fields.refresh", 0, len(selected))
+                completed = iter(range(1, len(selected) + 1))
+                total = len(selected)
+                report = refresh_fields(
+                    FieldRefreshRequest(
+                        source=source,
+                        source_sha256=sha256_bytes(current),
+                        output=output,
+                        part=name,
+                        fields=selected,
+                        progress_callback=lambda field, steps=completed, total=total: (
+                            options.notify("fields.refresh", next(steps), total)
+                        ),
+                    )
+                )
+                if not report.passed:
+                    raise _load_refusal(
+                        report.code or "load_dirty_fields_refused",
+                        "Dirty field refresh refused.",
+                        name,
+                    )
+                self._adopt("load-dirty-fields", output.read_bytes(), operation_detail(report))
+                options.notify("fields.refresh", len(selected), len(selected))
 
     def _set_part(self, name: str, data: bytes) -> None:
-        self._changed[name] = data
+        self._changed[name] = self._with_load_preferences(name, data)
         self._trees.pop(name, None)
 
     def _record(
@@ -2423,7 +4259,7 @@ class DocumentOperations(
                     # OPC part: keep its source entry, copied raw on save.
                     entries[name] = self._entries[name]
                     continue
-                data = archive.read(info)
+                data = self._with_load_preferences(name, archive.read(info), graph)
                 is_touched = name not in self._entries or data != self.part_bytes(name)
                 if is_touched:
                     touched.append(name)

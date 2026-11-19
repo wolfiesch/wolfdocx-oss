@@ -37,7 +37,7 @@ import json
 import re
 import zipfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree as ET
@@ -51,6 +51,7 @@ from .inspect import (
     serialize_xml_with_preserved_qnames,
 )
 from .package import PackageError, PackageGraph
+from .paragraph_format_effective import EffectiveParagraphFormat
 from .review import (
     _DOCUMENT,
     ReviewReport,
@@ -779,8 +780,14 @@ class RunFormatEdit:
     All these properties are returned by discover_format_targets.
     ``break_type`` (``page``, ``column`` or ``textWrapping``) and ``break_clear`` (``none``,
     ``left``, ``right`` or ``all``, textWrapping only) insert one w:br immediately after the
-    selected text. A run holding w:br or w:lastRenderedPageBreak is edited whole: a range
-    that covers only part of it refuses with ``format_break_partial_range_unsupported``.
+    selected text. An edit that only inserts a break may instead name a zero-width insertion
+    point (``start == end`` with an empty ``expected_old_text``): the break follows the text
+    before that offset, or, at offset 0, is written as its own run ahead of the paragraph's
+    text, carrying the first text run's properties. A paragraph without text therefore takes
+    a break at offset 0 too. A zero-width edit that sets any other property, or a second
+    break point at the same offset, refuses with ``format_range_invalid`` or
+    ``format_edits_overlap``. A run holding w:br or w:lastRenderedPageBreak is edited whole:
+    a range that covers only part of it refuses with ``format_break_partial_range_unsupported``.
     discover_format_targets lists breaks and cached page breaks with their text offsets.
     """
 
@@ -1142,7 +1149,7 @@ def _validate_run_edit_dict(value: Mapping[str, Any]) -> RunFormatEdit:
     end = value["end"]
     if isinstance(start, bool) or not isinstance(start, int) or start < 0:
         raise ValueError("format_range_invalid")
-    if isinstance(end, bool) or not isinstance(end, int) or end < 0 or end <= start:
+    if isinstance(end, bool) or not isinstance(end, int) or end < 0 or end < start:
         raise ValueError("format_range_invalid")
 
     expected_old_text = value["expected_old_text"]
@@ -1255,7 +1262,7 @@ def _validate_run_edit_dict(value: Mapping[str, Any]) -> RunFormatEdit:
     if all(p is None for p in format_props):
         raise ValueError("format_run_edit_noop_invalid")
 
-    return RunFormatEdit(
+    edit = RunFormatEdit(
         paragraph=paragraph,
         start=start,
         end=end,
@@ -1283,6 +1290,9 @@ def _validate_run_edit_dict(value: Mapping[str, Any]) -> RunFormatEdit:
         break_type=value.get("break_type"),
         break_clear=value.get("break_clear"),
     )
+    if edit.start == edit.end and not _is_break_point(edit):
+        raise ValueError("format_range_invalid")
+    return edit
 
 
 def _validate_spacing_spec(value: Any) -> SpacingSpec:
@@ -1792,8 +1802,7 @@ def _catalog_package_styles(
         "paragraph": ({}, {}, {}),
         "character": ({}, {}, {}),
     }
-    def word(local):
-        return Q(ns, local)
+    word = lambda local: Q(ns, local)
     for style_elem in styles_root.findall(word("style")):
         stype = style_elem.get(word("type")) or "paragraph"
         sid = style_elem.get(word("styleId")) or style_elem.get("styleId")
@@ -1989,8 +1998,7 @@ def _read_ruby(run: ET.Element, namespace: str) -> dict[str, Any] | None:
 
 
 def _apply_run_format(run: ET.Element, edit: RunFormatEdit, namespace: str) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     rpr = run.find(word("rPr"))
     if rpr is None:
         rpr = ET.Element(word("rPr"))
@@ -2155,8 +2163,7 @@ def _apply_run_format(run: ET.Element, edit: RunFormatEdit, namespace: str) -> N
 def _apply_paragraph_format(
     paragraph: ET.Element, edit: ParagraphFormatEdit, namespace: str
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     ppr = paragraph.find(word("pPr"))
     if ppr is None:
         ppr = ET.Element(word("pPr"))
@@ -2431,6 +2438,38 @@ def _break_element(edit: RunFormatEdit, namespace: str) -> ET.Element:
     return ET.Element(Q(namespace, "br"), attributes)
 
 
+_RUN_EDIT_ANCHOR_FIELDS = frozenset(
+    {"paragraph", "start", "end", "expected_old_text", "structure_fingerprint_sha256", "part"}
+)
+_NON_BREAK_RUN_FIELDS = tuple(
+    field.name
+    for field in fields(RunFormatEdit)
+    if field.name not in _RUN_EDIT_ANCHOR_FIELDS | {"break_type", "break_clear"}
+)
+
+
+def _is_break_point(edit: RunFormatEdit) -> bool:
+    """A zero-width run edit whose only change is one break at a text offset."""
+    return (
+        edit.start == edit.end
+        and edit.break_type is not None
+        and edit.expected_old_text == ""
+        and all(getattr(edit, name) is None for name in _NON_BREAK_RUN_FIELDS)
+    )
+
+
+def _break_point_run(
+    edit: RunFormatEdit, template: ET.Element | None, namespace: str
+) -> ET.Element:
+    """A new run holding one break, carrying ``template``'s run properties when given."""
+    run = ET.Element(Q(namespace, "r"))
+    properties = template.find(Q(namespace, "rPr")) if template is not None else None
+    if properties is not None:
+        run.append(copy.deepcopy(properties))
+    run.append(_break_element(edit, namespace))
+    return run
+
+
 def _read_frame(frame: ET.Element, namespace: str) -> dict[str, Any]:
     """Report the attributes of one w:framePr under their snake_case request names."""
     result: dict[str, Any] = {}
@@ -2481,8 +2520,29 @@ def _read_breaks(mapping: _ParagraphMap, namespace: str) -> tuple[list[dict[str,
     return breaks, rendered
 
 
+def _enclosing_table(
+    paragraph: ET.Element, parents: Mapping[int, ET.Element], namespace: str
+) -> ET.Element | None:
+    """The innermost ``w:tbl`` holding ``paragraph``, if any."""
+    current = parents.get(id(paragraph))
+    while current is not None:
+        if current.tag == Q(namespace, "tbl"):
+            return current
+        current = parents.get(id(current))
+    return None
+
+
 def discover_format_targets(source: str | Path, *, part: str = _DOCUMENT) -> dict[str, Any]:
-    """List source-bound paragraph targets and available styles without writing."""
+    """List source-bound paragraph targets and available styles without writing.
+
+    Each target reports the paragraph's direct ``w:pPr`` values and, under
+    ``effective_paragraph_format``, the style-resolved alignment, spacing, line spacing
+    and indentation with the layer that supplied each value and any contribution left
+    unresolved (see :mod:`wolfdocx.paragraph_format_effective`). When
+    ``word/styles.xml`` is refused by the package XML safety limits, every
+    ``effective_paragraph_format`` is ``None`` and ``effective_paragraph_format_code``
+    names the refusal.
+    """
     path = Path(source)
     if not path.is_file():
         return {
@@ -2561,8 +2621,7 @@ def discover_format_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
         }
 
     parents = {id(child): parent for parent in root.iter() for child in parent}
-    def word(local):
-        return Q(part_ns, local)
+    word = lambda local: Q(part_ns, local)
 
     _, _, styles_catalog = _catalog_package_styles(graph, part_ns)
     try:
@@ -2577,6 +2636,8 @@ def discover_format_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
 
     # styles_authoring imports this module, so defer the shared script-property reader.
     from .styles_authoring import _read_script_properties
+
+    effective_reader, effective_code = EffectiveParagraphFormat.from_graph(graph)
 
     targets: list[dict[str, Any]] = []
     for p_idx, paragraph in enumerate(root.iter(word("p")), start=1):
@@ -2842,6 +2903,13 @@ def discover_format_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
                 "runs": runs_info,
                 "editable_ranges": editable_ranges,
                 "context_code": context_code,
+                "effective_paragraph_format": (
+                    effective_reader.resolve(
+                        paragraph, part_ns, _enclosing_table(paragraph, parents, part_ns)
+                    )
+                    if effective_reader is not None
+                    else None
+                ),
             }
         )
 
@@ -2853,6 +2921,7 @@ def discover_format_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
         "targets": targets,
         "styles": styles_catalog,
         "compatibility_mode": compatibility_mode,
+        "effective_paragraph_format_code": effective_code,
     }
 
 
@@ -2943,7 +3012,7 @@ def author_format(request: FormatRequest) -> FormatReport:
     for key, p_run_edits in run_edits_by_part_p.items():
         sorted_edits = sorted(p_run_edits, key=lambda e: (e.start, e.end))
         for e1, e2 in itertools.pairwise(sorted_edits):
-            if e1.end > e2.start:
+            if e1.end > e2.start or e1.start == e1.end == e2.start == e2.end:
                 return _format_refusal(request, "format_edits_overlap")
 
     # Load and parse roots for all touched parts
@@ -2995,8 +3064,15 @@ def author_format(request: FormatRequest) -> FormatReport:
 
         p_text = mapping.text
         for edit in p_run_edits:
-            if edit.start < 0 or edit.end > len(p_text) or edit.end <= edit.start:
+            if edit.start < 0 or edit.end > len(p_text) or edit.end < edit.start:
                 return _format_refusal(request, "format_range_invalid")
+            if edit.start == edit.end and not _is_break_point(edit):
+                return _format_refusal(request, "format_range_invalid")
+            if edit.start == edit.end and any(
+                run.text and run.end == edit.start and run.element.find(Q(ns, "ruby")) is not None
+                for run in mapping.runs
+            ):
+                return _format_refusal(request, "format_break_ruby_unsupported")
             if p_text[edit.start : edit.end] != edit.expected_old_text:
                 return _format_refusal(request, "format_expected_text_mismatch")
             if edit.ruby is not None and edit.ruby.base_text != edit.expected_old_text:
@@ -3071,6 +3147,16 @@ def author_format(request: FormatRequest) -> FormatReport:
         mapping = _format_paragraph_map(paragraph, ns)
         runs_by_id = {id(r.element): r for r in mapping.runs}
         boundaries = sorted({e.start for e in p_run_edits} | {e.end for e in p_run_edits})
+        points = [e for e in p_run_edits if e.start == e.end]
+        # A point at offset 0 precedes all text, so no slice ends there: it gets its own run
+        # ahead of the first text run (still at its source index, since nothing before it
+        # is split), or at the paragraph end when the paragraph has no text.
+        leading = next((e for e in points if e.start == 0), None)
+        first_text_run = next((r for r in mapping.runs if r.text), None)
+        leading_template = first_text_run.element if first_text_run is not None else None
+        leading_index = (
+            list(paragraph).index(leading_template) if leading_template is not None else None
+        )
 
         child_list = list(paragraph)
         for child in child_list:
@@ -3101,6 +3187,9 @@ def author_format(request: FormatRequest) -> FormatReport:
                     _apply_run_format(cloned, matched_edit, ns)
                     if matched_edit.break_type is not None and upper == matched_edit.end:
                         cloned.append(_break_element(matched_edit, ns))
+                for point in points:
+                    if point.start == upper:
+                        cloned.append(_break_element(point, ns))
 
                 new_runs.append(cloned)
 
@@ -3109,6 +3198,13 @@ def author_format(request: FormatRequest) -> FormatReport:
             paragraph.remove(child)
             for offset, new_r in enumerate(new_runs):
                 paragraph.insert(idx + offset, new_r)
+
+        if leading is not None:
+            leading_run = _break_point_run(leading, leading_template, ns)
+            if leading_index is None:
+                paragraph.append(leading_run)
+            else:
+                paragraph.insert(leading_index, leading_run)
 
     # Serialize modified parts
     replacements: dict[str, bytes] = {}

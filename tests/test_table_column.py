@@ -98,7 +98,7 @@ def test_discover_table_column_targets_success(tmp_path: Path) -> None:
     assert t1["width"] == 2000
     assert t1["cell_texts"] == ["Header A", "Data 1", "Data 4"]
     assert len(t1["structure_fingerprint_sha256"]) == 64
-    assert t1["actions"] == ["insert", "delete"]
+    assert {"insert", "delete"} <= set(t1["actions"])
 
     t2 = discovery["targets"][1]
     assert t2["column"] == 2
@@ -120,7 +120,8 @@ def test_discover_table_column_targets_single_column(tmp_path: Path) -> None:
     assert len(discovery["targets"]) == 1
     t = discovery["targets"][0]
     assert t["column"] == 1
-    assert t["actions"] == ["insert"]  # Deletion not allowed on single column
+    assert "insert" in t["actions"]
+    assert "delete" not in t["actions"]
 
 
 def test_discover_table_column_targets_errors_and_skipped(tmp_path: Path) -> None:

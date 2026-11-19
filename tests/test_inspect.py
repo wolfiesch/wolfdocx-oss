@@ -9,10 +9,10 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from wolfdocx import PackageLimits
-from wolfdocx.inspect import inspect_docx
 from wolfdocx.inspect import (
     _parse_bounded_xml,
     _XmlSafetyError,
+    inspect_docx,
     parse_xml_with_preserved_qnames,
     serialize_xml_with_preserved_qnames,
 )
@@ -28,7 +28,8 @@ def write_fixture(path, *, dangling_relationship=False):
     )
     relationships = (
         f'<Relationship Id="rIdMissing" Type="{R}/header" Target="missing.xml"/>'
-        if dangling_relationship else ""
+        if dangling_relationship
+        else ""
     )
     return write_package(path, body, relationships=relationships)
 
@@ -179,22 +180,32 @@ def test_inspects_iso_strict_wordprocessingml_semantics(tmp_path):
     drawings = "<w:r><w:drawing/></w:r>" * 3
     body = (
         '<w:p><w:bookmarkStart w:id="1" w:name="Anchor"/>'
-        '<w:r><w:t>Strict paragraph</w:t></w:r>'
-        + drawings + '<w:bookmarkEnd w:id="1"/></w:p>'
-        + paragraph("Second strict paragraph") + paragraph("Third strict paragraph")
+        "<w:r><w:t>Strict paragraph</w:t></w:r>"
+        + drawings
+        + '<w:bookmarkEnd w:id="1"/></w:p>'
+        + paragraph("Second strict paragraph")
+        + paragraph("Third strict paragraph")
     )
-    styles = f'<w:styles xmlns:w="{W}">' + "".join(
-        f'<w:style w:type="paragraph" w:styleId="Style{index}">'
-        f'<w:name w:val="Style {index}"/></w:style>' for index in range(6)
-    ) + "</w:styles>"
+    styles = (
+        f'<w:styles xmlns:w="{W}">'
+        + "".join(
+            f'<w:style w:type="paragraph" w:styleId="Style{index}">'
+            f'<w:name w:val="Style {index}"/></w:style>'
+            for index in range(6)
+        )
+        + "</w:styles>"
+    )
     write_package(document, body, parts={"word/styles.xml": styles})
     with zipfile.ZipFile(document) as archive:
         parts = {entry.filename: archive.read(entry.filename) for entry in archive.infolist()}
     with zipfile.ZipFile(document, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, payload in parts.items():
-            archive.writestr(name, payload.replace(W.encode(), strict_word.encode()).replace(
-                R.encode(), b"http://purl.oclc.org/ooxml/officeDocument/relationships"
-            ))
+            archive.writestr(
+                name,
+                payload.replace(W.encode(), strict_word.encode()).replace(
+                    R.encode(), b"http://purl.oclc.org/ooxml/officeDocument/relationships"
+                ),
+            )
 
     report = inspect_docx(document)
 

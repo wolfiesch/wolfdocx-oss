@@ -238,8 +238,7 @@ def _select_cell(
     root: ET.Element, edit: ReportEdit, namespace: str
 ) -> ET.Element | None:
     assert edit.table is not None and edit.row is not None and edit.cell is not None
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tables = list(root.iter(word("tbl")))
     if edit.table > len(tables):
         return None
@@ -696,8 +695,7 @@ def discover_report_targets(
     targets: list[dict[str, Any]] = []
     effective_spaces = _effective_xml_space_by_element(root)
     unsupported_contexts = _unsupported_context_by_element(root, namespace)
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for table_index, table in enumerate(root.iter(word("tbl")), start=1):
         for row_index, row in enumerate(table.findall(word("tr")), start=1):
             for cell_index, cell in enumerate(row.findall(word("tc")), start=1):

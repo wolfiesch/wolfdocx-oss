@@ -5,8 +5,9 @@
 WolfDocx opens a `.docx`, reads its paragraphs, runs, and tables, applies edits in
 memory, and saves a new file. Each edit rewrites only the parts it changes; every
 other part of the package is copied from the source unchanged. An edit that cannot be
-applied safely is refused with a code and leaves the document as it was. WolfDocx
-does not create documents from scratch, render pages, or convert to PDF.
+applied safely is refused with a code and leaves the document as it was.
+`wolfdocx.builder.DocumentBuilder` writes a new document with paragraphs, runs,
+tables, and sections. WolfDocx does not render pages or convert to PDF.
 
 [![PyPI](https://img.shields.io/pypi/v/wolfdocx)](https://pypi.org/project/wolfdocx/)
 [![Python versions](https://img.shields.io/pypi/pyversions/wolfdocx)](https://pypi.org/project/wolfdocx/)
@@ -88,6 +89,8 @@ All edits are methods on `Document` and are held in memory until `save`.
 | Sections | `set_page_setup` (page size, orientation, margins, columns), `insert_section_break`, `delete_section_break`, `edit_header_footer` |
 | Definitions | `styles`, `lists`, `background` as editable copies you assign back |
 | Approved-value edits | `wolfdocx.reporting`: discover editable cells and paragraphs, then apply edits bound to the source file's SHA-256 |
+| New documents | `wolfdocx.builder.DocumentBuilder`: `write_paragraph`, `append_run`, `insert_table`, `add_table`, `add_section`, `save` |
+| Comments | `wolfdocx.comments`: `discover_comment_targets`, then `author_comment` to insert, update, or delete a comment bound to the source text |
 
 ## Quickstart
 
@@ -428,7 +431,7 @@ editing session and explicit targets. Common python-docx calls map like this:
 | python-docx | WolfDocx |
 | --- | --- |
 | `Document("in.docx")` | `Document("in.docx")`, preferably as a context manager |
-| `Document()` (new document from the default template) | Not available. Start from an existing `.docx`. |
+| `Document()` (new document from the default template) | `DocumentBuilder()` from `wolfdocx.builder`, for paragraphs, runs, tables, and sections |
 | `doc.paragraphs`, `paragraph.text` | `doc.get_story(StoryType.BODY).paragraphs`, `paragraph.to_string("txt")` |
 | `doc.tables`, `table.rows`, `row.cells`, `cell.text` | `body.tables`, `table.get_child_nodes(NodeType.ROW)`, `row.get_child_nodes(NodeType.CELL)`, `cell.to_string("txt")` |
 | `run.text = "..."` | `run.text = "..."` on a run node, or `doc.set_run_text(paragraph, run, "...")` |
@@ -449,7 +452,10 @@ Differences to plan for:
   `set_run_text` (see [How targets are addressed](https://github.com/wolfiesch/wolfdocx-oss#how-targets-are-addressed)).
 - python-docx has no built-in find and replace; `find_replace` handles phrases split
   across runs.
-- Keep python-docx for building new documents from code. A
+- For python-docx call names, `pip install wolfdocx-docx` adds
+  `import wolfdocx_docx as docx`, a subset of the python-docx API that runs on this
+  package. Keep python-docx for new documents that need pictures, shapes,
+  hyperlinks, or fields. A
   [comparison](https://wolfdocx.com/python-docx-alternative) and a
   [migration checklist](https://wolfdocx.com/python-docx-migration) for the
   Commercial API are on wolfdocx.com.
@@ -459,12 +465,18 @@ Differences to plan for:
 This repository is WolfDocx Community, the MIT-licensed read and edit core published
 on PyPI. It does not:
 
-- create a new document without a source `.docx`;
+- add pictures, shapes, hyperlinks, fields, or document settings to a document
+  built with `DocumentBuilder`;
 - lay out pages, render, or convert to PDF or images;
 - refresh fields or rebuild a table of contents;
 - run mail merge over `MERGEFIELD` templates or repeat template table rows per record;
 - merge several documents into one;
 - open legacy binary `.doc` files (refused with `document_format_unsupported`).
+
+Requesting one of these from this package, for example `SaveOptions.create("pdf")`
+or `DocumentBuilder.append_image`, raises `ModuleNotFoundError` with the message
+`commercial_feature_unavailable`. Reading, editing, and saving `.docx` never need
+them.
 
 WolfDocx Commercial, an organization-scoped subscription installed from an
 authenticated package index, and Wolf Runtime, licensed under a written Order, cover
@@ -514,15 +526,17 @@ repository.
 
 ## Status and versioning
 
-WolfDocx 0.1.0, released 2026-10-29, was the first public release. 0.1.1 updates the
-documentation and package metadata and leaves the library code unchanged. The PyPI
+WolfDocx 0.1.0, released 2026-10-29, was the first public release. 0.1.1 updated the
+documentation and package metadata. 0.1.2 adds `wolfdocx.builder` and
+`wolfdocx.comments` and is the first release regenerated from one source commit. The PyPI
 classifier is `Development Status :: 4 - Beta`. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), under which a 0.x minor
 release may change the public API; pin a version in production. Changes are recorded
 in the [changelog](https://github.com/wolfiesch/wolfdocx-oss/blob/main/CHANGELOG.md).
-The code was extracted from the author's private source repository and reduced to
-this pure-Python subset; see
-[PROVENANCE.md](https://github.com/wolfiesch/wolfdocx-oss/blob/main/PROVENANCE.md).
+The `src/wolfdocx` package is regenerated from the author's source repository at a
+single commit, and every module is copied from that commit unchanged;
+[PROVENANCE.md](https://github.com/wolfiesch/wolfdocx-oss/blob/main/PROVENANCE.md)
+names the commit and lists the SHA-256 of each module.
 
 ## Security
 
@@ -546,7 +560,7 @@ include facts derived from document parts, including part text. Set
 
 The same MIT-licensed family covers the other Office formats:
 
-- [WolfXL](https://github.com/SynthGL/wolfxl-oss): read, write, and edit Excel
+- [WolfXL](https://pypi.org/project/wolfxl/): read, write, and edit Excel
   `.xlsx` and `.xlsm` workbooks, an openpyxl alternative (`pip install wolfxl`).
 - [WolfPPT](https://github.com/wolfiesch/wolfppt-oss): edit PowerPoint `.pptx`
   decks, a python-pptx alternative (`pip install wolfppt`).
@@ -561,6 +575,8 @@ python -m pytest
 
 Open an [issue](https://github.com/wolfiesch/wolfdocx-oss/issues) before a large
 change. CI runs the same lint and test commands on every push and pull request.
+Changes to `src/wolfdocx` are ported to the source repository and arrive in the
+next regenerated release.
 
 ## License
 

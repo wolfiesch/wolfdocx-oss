@@ -276,9 +276,7 @@ STYLED_TABLE_TEXT = (
 
 
 def _cnf(value: str) -> str:
-    flags = "".join(
-        f' w:{name}="{value[index]}"' for index, name in enumerate(_CNF_ATTRIBUTES)
-    )
+    flags = "".join(f' w:{name}="{value[index]}"' for index, name in enumerate(_CNF_ATTRIBUTES))
     return f'<w:cnfStyle w:val="{value}"{flags}/>'
 
 
@@ -415,7 +413,7 @@ def _styled_table_styles_xml() -> str:
         "<w:semiHidden/><w:unhideWhenUsed/></w:style>"
         '<w:style w:type="table" w:default="1" w:styleId="TableNormal">'
         '<w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/>'
-        "<w:unhideWhenUsed/><w:tblPr><w:tblInd w:w=\"0\" w:type=\"dxa\"/>"
+        '<w:unhideWhenUsed/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/>'
         '<w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/>'
         '<w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar>'
         "</w:tblPr></w:style>"

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from ._bridge import SessionEditReport
 from .lists import ListEdits
 from .paragraphs import ParagraphEdits
+from .pictures import PictureEdits
 from .run_edits import RunEdits
 from .sections import SectionEdits
 from .styling import StylingEdits
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ListEdits",
     "ParagraphEdits",
+    "PictureEdits",
     "RunEdits",
     "RunReport",
     "RunRequest",

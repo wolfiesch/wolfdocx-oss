@@ -110,10 +110,13 @@ class WolfDocxError(Exception):
 
 
 def _trusted_code_errors() -> tuple[type[Exception], ...]:
-    """Domain exceptions whose stable machine codes can be exposed safely."""
+    "Trust only core domain errors and types from the installed provider."
+    from ._optional import feature_module
     from .content import ContentPolicyError
 
-    return WolfDocxError, ContentPolicyError
+    provider = feature_module("_commercial_features", required=False)
+    extra = () if provider is None else provider.trusted_code_errors()
+    return (WolfDocxError, ContentPolicyError, *extra)
 
 
 def classify_failure(error: Exception) -> Failure:

@@ -1746,7 +1746,7 @@ def test_author_section_break_delete_title_pg_effective_equality_regression(
 
 
 # ---------------------------------------------------------------------------
-# Section Break Update Tests (commercial-docx-section-break-update-20260918)
+# Section Break Update Tests
 # ---------------------------------------------------------------------------
 
 

@@ -1414,7 +1414,7 @@ def _apply_extended_properties(
 
 def _read_extended_properties(xml_bytes: bytes) -> dict[str, Any]:
     try:
-        root = ET.fromstring(xml_bytes)
+        root = parse_xml_with_preserved_qnames(xml_bytes)
     except ET.ParseError as exc:
         raise ValueError("properties_part_malformed") from exc
     namespace = _part_namespace(root, EP_NS, "Properties")
@@ -1671,7 +1671,7 @@ def discover_property_targets(source: str | Path) -> dict[str, Any]:
         }
 
     try:
-        rels_root = ET.fromstring(parts["_rels/.rels"])
+        rels_root = parse_xml_with_preserved_qnames(parts["_rels/.rels"])
     except ET.ParseError:
         return {
             "passed": False,
@@ -1709,7 +1709,7 @@ def discover_property_targets(source: str | Path) -> dict[str, Any]:
     core_exists = core_part is not None and core_part in parts
     if core_exists and core_part is not None:
         try:
-            core_root = ET.fromstring(parts[core_part])
+            core_root = parse_xml_with_preserved_qnames(parts[core_part])
             if core_root.tag != f"{{{CP_NS}}}coreProperties":
                 return {
                     "passed": False,

@@ -76,8 +76,7 @@ def _unrelated_parts_preserved(source: Path, candidate: Path, changed: frozenset
 
 def _is_supported_table(table: ET.Element, namespace: str) -> bool:
     """True if table has supported body table structure and at least one row."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return False
     rows = table.findall(word("tr"))
