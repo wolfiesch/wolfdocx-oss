@@ -5,15 +5,22 @@ Provides verified, source-bound authoring for selected-section page dimensions
 left, right, header, footer, gutter), equal or explicit-width columns with optional
 separators, and section document grids (type, linePitch, charSpace).
 
-Columns and document grid:
+Native renderer boundary:
+    The WolfDocx native layout renderer admits bounded equal-width multi-column
+    flow (cols num >= 1) with ordered sequential filling across columns then
+    pages. Unequal-width columns (w:equalWidth="0", unequal w:col children, or
+    multiple w:cols elements) and column configurations whose gutters exceed the
+    page text area are refused as `native_render_section_unsupported`.
     Page setup authoring supports bounded equal and explicit-width columns
     (up to 45 columns). ``ColumnsSpec.widths`` contains one positive twip width
     per column; optional ``spaces`` contains one gap per column, with the last
     ignored for usable-width accounting. ``separator=None`` preserves w:sep.
-    Column configurations whose occupied width exceeds the usable page width
-    are refused as ``page_setup_columns_exceed_usable_width``.
     ``document_grid`` accepts type, line_pitch (twips), and char_space (signed
-    1/4096-character units); omitted attributes are preserved.
+    1/4096-character units); omitted attributes are preserved. Native rendering
+    admits valid grids with a named partial-grid omission in ``Layout.boundaries``:
+    linePitch and charSpace snapping are omitted, using natural spacing and glyph
+    advances. Column admission is reported separately via
+    ``native_column_layout_supported``.
 
 Odd and even page headers:
     ``different_odd_and_even_pages`` maps to the document-wide
@@ -78,6 +85,7 @@ from .protection import (
     _insert_settings_child,
 )
 from .review import _DOCUMENT, ReviewReport, _publish, _word_namespace
+from .style_resolution import is_section_column_layout_supported
 
 __all__ = [
     "ColumnsSpec",
@@ -186,6 +194,9 @@ _ALLOWED_REQUEST_FIELDS = frozenset(
 )
 _ALLOWED_PAGE_SIZE_FIELDS = frozenset({"width", "height", "code"})
 _REQUIRED_PAGE_SIZE_FIELDS = frozenset({"width", "height"})
+# Explicit w:pgSz and w:pgMar values that page size, orientation, margin, and column
+# changes resolve; other requests leave a section that lacks any of them unchanged.
+_EXPLICIT_GEOMETRY_KEYS = ("width", "height", "top", "bottom", "left", "right")
 # python-docx Section.header_distance/footer_distance name the w:pgMar header/footer.
 _MARGIN_ALIASES = (("header_distance", "header"), ("footer_distance", "footer"))
 _ALLOWED_MARGINS_FIELDS = frozenset(
@@ -1185,6 +1196,8 @@ class PageSetupTarget:
     page_borders: dict[str, Any] | None = None
     usable_area: dict[str, Any] | None = None
     supported: bool = True
+    non_geometry_supported: bool = True
+    native_column_layout_supported: bool = True
     footnote_properties: dict[str, Any] | None = None
     document_grid: dict[str, Any] | None = None
 
@@ -1211,6 +1224,8 @@ class PageSetupTarget:
             "document_grid": self.document_grid,
             "usable_area": self.usable_area,
             "supported": self.supported,
+            "non_geometry_supported": self.non_geometry_supported,
+            "native_column_layout_supported": self.native_column_layout_supported,
         }
 
 
@@ -1306,6 +1321,7 @@ class PageSetupReport:
     page_setup: dict[str, Any] | None = None
     target_change_report: dict[str, Any] | None = None
     non_target_parts_preserved: bool | None = None
+    native_column_layout_supported: bool | None = None
 
     @property
     def passed(self) -> bool:
@@ -1329,6 +1345,8 @@ class PageSetupReport:
             result["target_change_report"] = self.target_change_report
         if self.non_target_parts_preserved is not None:
             result["non_target_parts_preserved"] = self.non_target_parts_preserved
+        if self.native_column_layout_supported is not None:
+            result["native_column_layout_supported"] = self.native_column_layout_supported
         return result
 
 
@@ -1345,6 +1363,7 @@ def _page_setup_refusal(
         page_setup=None,
         target_change_report=None,
         non_target_parts_preserved=None,
+        native_column_layout_supported=None,
     )
 
 
@@ -1736,14 +1755,13 @@ def discover_page_setup_targets(
             or footnote_info["has_duplicate_footnote_pr"]
             or len(sect_pr.findall(Q(ns, "docGrid"))) > 1
         )
-        is_supported = (
-            has_explicit_size
-            and has_explicit_margins
-            and cols_info["is_valid"]
+        non_geometry_supported = (
+            cols_info["is_valid"]
             and not has_duplicate
             and is_context_supported
             and vertical_info["is_valid"]
         )
+        is_supported = has_explicit_size and has_explicit_margins and non_geometry_supported
 
         usable_width: int | None = None
         usable_height: int | None = None
@@ -1809,6 +1827,13 @@ def discover_page_setup_targets(
                 else None
             ),
             supported=is_supported,
+            non_geometry_supported=non_geometry_supported,
+            native_column_layout_supported=is_section_column_layout_supported(
+                sect_pr,
+                width=geom["width"],
+                left=geom["left"],
+                right=geom["right"],
+            ),
         )
         targets.append(target.to_dict())
 
@@ -1934,94 +1959,121 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
         return _page_setup_refusal(request, "page_setup_columns_unsupported")
     if grid_spec is not None and len(target_sect_pr.findall(Q(namespace, "docGrid"))) > 1:
         return _page_setup_refusal(request, "page_setup_document_grid_unsupported")
-    # Resolve effective width and height
-    if request.page_size is not None and request.page_size.width is not None:
-        eff_width = request.page_size.width
-    elif existing_geom["width"] is not None:
-        eff_width = existing_geom["width"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    if request.page_size is not None and request.page_size.height is not None:
-        eff_height = request.page_size.height
-    elif existing_geom["height"] is not None:
-        eff_height = existing_geom["height"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    # Resolve orientation; w:w and w:h always describe the page as oriented.
-    if request.orientation is not None:
-        if request.orientation not in _ALLOWED_ORIENTATIONS:
-            return _page_setup_refusal(request, "page_setup_orientation_invalid")
-        eff_orientation = request.orientation
-        if (eff_orientation == "landscape" and eff_width < eff_height) or (
-            eff_orientation == "portrait" and eff_height < eff_width
-        ):
-            if request.page_size is not None:
-                return _page_setup_refusal(request, "page_setup_orientation_dimensions_mismatch")
-            eff_width, eff_height = eff_height, eff_width
-    elif existing_geom["orientation"] is not None:
-        eff_orientation = existing_geom["orientation"]
-    else:
-        eff_orientation = "portrait"
-
-    # Resolve effective margins
-    if request.margins is not None and request.margins.top is not None:
-        eff_top = request.margins.top
-    elif existing_geom["top"] is not None:
-        eff_top = existing_geom["top"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    if request.margins is not None and request.margins.bottom is not None:
-        eff_bottom = request.margins.bottom
-    elif existing_geom["bottom"] is not None:
-        eff_bottom = existing_geom["bottom"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    if request.margins is not None and request.margins.left is not None:
-        eff_left = request.margins.left
-    elif existing_geom["left"] is not None:
-        eff_left = existing_geom["left"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    if request.margins is not None and request.margins.right is not None:
-        eff_right = request.margins.right
-    elif existing_geom["right"] is not None:
-        eff_right = existing_geom["right"]
-    else:
-        return _page_setup_refusal(request, "page_setup_geometry_missing")
-
-    # Validate usable page area
-    usable_width = eff_width - eff_left - eff_right
-    usable_height = eff_height - eff_top - eff_bottom
-    if usable_width <= 0 or usable_height <= 0:
-        return _page_setup_refusal(request, "page_setup_usable_area_invalid")
-
-    # Resolve effective columns
-    if request.columns is not None:
-        eff_col_count = request.columns.count
-        eff_col_spacing = request.columns.spacing
-    else:
-        eff_col_count = existing_cols["count"]
-        eff_col_spacing = existing_cols["spacing"]
-
-    widths = (
-        request.columns.widths
-        if request.columns is not None
-        else (existing_cols["widths"] if not existing_cols["equal_width"] else None)
+    # Only page size, orientation, margin, and column changes need the effective page.
+    # Any other request leaves a section without explicit w:pgSz or w:pgMar values as it
+    # is, instead of refusing it or inventing geometry the source never declared.
+    keep_incomplete_geometry = (
+        request.page_size is None
+        and request.orientation is None
+        and request.margins is None
+        and request.columns is None
+        and any(existing_geom[key] is None for key in _EXPLICIT_GEOMETRY_KEYS)
     )
-    spaces = request.columns.spaces if request.columns is not None else existing_cols["spaces"]
-    if widths:
-        gaps = spaces if spaces is not None else [None] * eff_col_count
-        occupied = sum(widths) + sum(eff_col_spacing if gap is None else gap for gap in gaps[:-1])
-        exceeds_width = occupied > usable_width
+    if keep_incomplete_geometry:
+        eff_width = existing_geom["width"]
+        eff_height = existing_geom["height"]
+        eff_orientation = existing_geom["orientation"]
+        eff_top = existing_geom["top"]
+        eff_bottom = existing_geom["bottom"]
+        eff_left = existing_geom["left"]
+        eff_right = existing_geom["right"]
+        usable_area: dict[str, int] | None = None
     else:
-        exceeds_width = eff_col_count > 1 and (eff_col_count - 1) * eff_col_spacing >= usable_width
-    if exceeds_width:
-        return _page_setup_refusal(request, "page_setup_columns_exceed_usable_width")
+        # Resolve effective width and height
+        if request.page_size is not None and request.page_size.width is not None:
+            eff_width = request.page_size.width
+        elif existing_geom["width"] is not None:
+            eff_width = existing_geom["width"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        if request.page_size is not None and request.page_size.height is not None:
+            eff_height = request.page_size.height
+        elif existing_geom["height"] is not None:
+            eff_height = existing_geom["height"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        # Resolve orientation; w:w and w:h always describe the page as oriented.
+        if request.orientation is not None:
+            if request.orientation not in _ALLOWED_ORIENTATIONS:
+                return _page_setup_refusal(request, "page_setup_orientation_invalid")
+            eff_orientation = request.orientation
+            if (eff_orientation == "landscape" and eff_width < eff_height) or (
+                eff_orientation == "portrait" and eff_height < eff_width
+            ):
+                if request.page_size is not None:
+                    return _page_setup_refusal(
+                        request, "page_setup_orientation_dimensions_mismatch"
+                    )
+                eff_width, eff_height = eff_height, eff_width
+        elif existing_geom["orientation"] is not None:
+            eff_orientation = existing_geom["orientation"]
+        else:
+            eff_orientation = "portrait"
+
+        # Resolve effective margins
+        if request.margins is not None and request.margins.top is not None:
+            eff_top = request.margins.top
+        elif existing_geom["top"] is not None:
+            eff_top = existing_geom["top"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        if request.margins is not None and request.margins.bottom is not None:
+            eff_bottom = request.margins.bottom
+        elif existing_geom["bottom"] is not None:
+            eff_bottom = existing_geom["bottom"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        if request.margins is not None and request.margins.left is not None:
+            eff_left = request.margins.left
+        elif existing_geom["left"] is not None:
+            eff_left = existing_geom["left"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        if request.margins is not None and request.margins.right is not None:
+            eff_right = request.margins.right
+        elif existing_geom["right"] is not None:
+            eff_right = existing_geom["right"]
+        else:
+            return _page_setup_refusal(request, "page_setup_geometry_missing")
+
+        # Validate usable page area
+        usable_width = eff_width - eff_left - eff_right
+        usable_height = eff_height - eff_top - eff_bottom
+        if usable_width <= 0 or usable_height <= 0:
+            return _page_setup_refusal(request, "page_setup_usable_area_invalid")
+        usable_area = {"width": usable_width, "height": usable_height}
+
+        # Resolve effective columns
+        if request.columns is not None:
+            eff_col_count = request.columns.count
+            eff_col_spacing = request.columns.spacing
+        else:
+            eff_col_count = existing_cols["count"]
+            eff_col_spacing = existing_cols["spacing"]
+
+        widths = (
+            request.columns.widths
+            if request.columns is not None
+            else (existing_cols["widths"] if not existing_cols["equal_width"] else None)
+        )
+        spaces = request.columns.spaces if request.columns is not None else existing_cols["spaces"]
+        if widths:
+            gaps = spaces if spaces is not None else [None] * eff_col_count
+            occupied = sum(widths) + sum(
+                eff_col_spacing if gap is None else gap for gap in gaps[:-1]
+            )
+            exceeds_width = occupied > usable_width
+        else:
+            exceeds_width = (
+                eff_col_count > 1 and (eff_col_count - 1) * eff_col_spacing >= usable_width
+            )
+        if exceeds_width:
+            return _page_setup_refusal(request, "page_setup_columns_exceed_usable_width")
 
     # Document-wide odd/even header toggle lives in the settings part.
     odd_even_plan: _EvenAndOddHeadersPlan | None = None
@@ -2034,37 +2086,38 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
             return _page_setup_refusal(request, str(error))
 
     # Mutate selected section properties
-    # 1. w:pgSz (w:orient is an attribute of w:pgSz, never a child element)
     pg_sz = target_sect_pr.find(Q(namespace, "pgSz"))
-    if pg_sz is None:
-        pg_sz = ET.Element(Q(namespace, "pgSz"))
-        _insert_sect_pr_child(target_sect_pr, pg_sz)
-
-    pg_sz.set(Q(namespace, "w"), str(eff_width))
-    pg_sz.set(Q(namespace, "h"), str(eff_height))
-    if request.orientation is not None:
-        pg_sz.set(Q(namespace, "orient"), eff_orientation)
-    if request.page_size is not None and request.page_size.code is not None:
-        pg_sz.set(Q(namespace, "code"), request.page_size.code)
-
-    # 2. w:pgMar
     pg_mar = target_sect_pr.find(Q(namespace, "pgMar"))
-    if pg_mar is None:
-        pg_mar = ET.Element(Q(namespace, "pgMar"))
-        _insert_sect_pr_child(target_sect_pr, pg_mar)
+    if not keep_incomplete_geometry:
+        # 1. w:pgSz (w:orient is an attribute of w:pgSz, never a child element)
+        if pg_sz is None:
+            pg_sz = ET.Element(Q(namespace, "pgSz"))
+            _insert_sect_pr_child(target_sect_pr, pg_sz)
 
-    pg_mar.set(Q(namespace, "top"), str(eff_top))
-    pg_mar.set(Q(namespace, "bottom"), str(eff_bottom))
-    pg_mar.set(Q(namespace, "left"), str(eff_left))
-    pg_mar.set(Q(namespace, "right"), str(eff_right))
+        pg_sz.set(Q(namespace, "w"), str(eff_width))
+        pg_sz.set(Q(namespace, "h"), str(eff_height))
+        if request.orientation is not None:
+            pg_sz.set(Q(namespace, "orient"), eff_orientation)
+        if request.page_size is not None and request.page_size.code is not None:
+            pg_sz.set(Q(namespace, "code"), request.page_size.code)
 
-    if request.margins is not None:
-        if request.margins.header is not None:
-            pg_mar.set(Q(namespace, "header"), str(request.margins.header))
-        if request.margins.footer is not None:
-            pg_mar.set(Q(namespace, "footer"), str(request.margins.footer))
-        if request.margins.gutter is not None:
-            pg_mar.set(Q(namespace, "gutter"), str(request.margins.gutter))
+        # 2. w:pgMar
+        if pg_mar is None:
+            pg_mar = ET.Element(Q(namespace, "pgMar"))
+            _insert_sect_pr_child(target_sect_pr, pg_mar)
+
+        pg_mar.set(Q(namespace, "top"), str(eff_top))
+        pg_mar.set(Q(namespace, "bottom"), str(eff_bottom))
+        pg_mar.set(Q(namespace, "left"), str(eff_left))
+        pg_mar.set(Q(namespace, "right"), str(eff_right))
+
+        if request.margins is not None:
+            if request.margins.header is not None:
+                pg_mar.set(Q(namespace, "header"), str(request.margins.header))
+            if request.margins.footer is not None:
+                pg_mar.set(Q(namespace, "footer"), str(request.margins.footer))
+            if request.margins.gutter is not None:
+                pg_mar.set(Q(namespace, "gutter"), str(request.margins.gutter))
 
     # 3. w:pgBorders
     if request.page_borders is not None:
@@ -2219,6 +2272,12 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
         raw = elem.get(Q(namespace, name)) or elem.get(name)
         return int(raw) if raw is not None and raw.isdigit() else None
 
+    native_col_supported = is_section_column_layout_supported(
+        target_sect_pr,
+        width=eff_width,
+        left=eff_left,
+        right=eff_right,
+    )
     fn = _extract_page_numbering_info(target_sect_pr, namespace)
     ln = _extract_line_numbering_info(target_sect_pr, namespace)
     va = _extract_vertical_alignment_info(target_sect_pr, namespace)
@@ -2229,7 +2288,7 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
         "page_size": {
             "width": eff_width,
             "height": eff_height,
-            "code": pg_sz.get(Q(namespace, "code")),
+            "code": pg_sz.get(Q(namespace, "code")) if pg_sz is not None else None,
         },
         "orientation": eff_orientation,
         "margins": {
@@ -2269,10 +2328,8 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
         "vertical_alignment": va["vertical_alignment"],
         "page_borders": pb["page_borders"],
         "footnote_properties": fnp["footnote_properties"],
-        "usable_area": {
-            "width": usable_width,
-            "height": usable_height,
-        },
+        "usable_area": usable_area,
+        "native_column_layout_supported": native_col_supported,
     }
 
     def verify_publication(staged: Path) -> str | None:
@@ -2299,6 +2356,8 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
             # Verify target section
             target_sec = s_sections[request.section - 1]
             t_geom = _extract_page_geometry(target_sec, s_ns)
+            if keep_incomplete_geometry and t_geom != existing_geom:
+                return "page_setup_staged_verification_failed"
             if t_geom["width"] != eff_width or t_geom["height"] != eff_height:
                 return "page_setup_staged_verification_failed"
             if request.orientation is not None and t_geom["orientation"] != eff_orientation:
@@ -2480,4 +2539,5 @@ def author_page_setup(request: PageSetupRequest) -> PageSetupReport:
         page_setup=target_change_report,
         target_change_report=target_change_report,
         non_target_parts_preserved=True,
+        native_column_layout_supported=native_col_supported,
     )

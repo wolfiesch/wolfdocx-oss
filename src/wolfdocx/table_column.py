@@ -189,10 +189,20 @@ def _has_illegal_xml_chars(text: str) -> bool:
     return False
 
 
-def _is_approved_row(row: ET.Element, namespace: str, *, allow_merged: bool = False) -> bool:
-    """True if row conforms to approved rectangular row conventions."""
-    def word(local):
-        return Q(namespace, local)
+def _is_approved_row(
+    row: ET.Element,
+    namespace: str,
+    *,
+    allow_merged: bool = False,
+    require_simple_text: bool = True,
+) -> bool:
+    """True if row conforms to approved rectangular row conventions.
+
+    Insertion and deletion rebuild whole cells, so they need one simple text run per cell.
+    Resize keeps every cell's content verbatim, so ``require_simple_text=False`` also admits
+    empty, multi-run, and multi-paragraph cells; hazard descendants stay refused either way.
+    """
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("trPr"), word("tc")} for child in row):
         return False
     tr_pr = row.find(word("trPr"))
@@ -210,7 +220,11 @@ def _is_approved_row(row: ET.Element, namespace: str, *, allow_merged: bool = Fa
         merged = properties is not None and any(
             properties.find(word(name)) is not None for name in ("vMerge", "hMerge", "gridSpan")
         )
-        if _simple_text_node(cell, namespace) is None and not (allow_merged and merged):
+        if (
+            require_simple_text
+            and _simple_text_node(cell, namespace) is None
+            and not (allow_merged and merged)
+        ):
             return False
         if (
             not allow_merged
@@ -227,8 +241,7 @@ def _is_approved_row(row: ET.Element, namespace: str, *, allow_merged: bool = Fa
 
 def _is_supported_table(table: ET.Element, namespace: str) -> bool:
     """True if table has supported body table structure."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return False
     tbl_grid = table.find(word("tblGrid"))
@@ -243,8 +256,7 @@ def _is_supported_table(table: ET.Element, namespace: str) -> bool:
 
 def _grid_row_cells(row: ET.Element, namespace: str) -> list[tuple[ET.Element, int, int]]:
     """Physical cells and their inclusive, one-based grid intervals."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     result = []
     start = 1
     for cell in row.findall(word("tc")):
@@ -256,11 +268,14 @@ def _grid_row_cells(row: ET.Element, namespace: str) -> list[tuple[ET.Element, i
 
 
 def _table_hazard_reason(
-    table: ET.Element, namespace: str, *, allow_merged: bool = False
+    table: ET.Element,
+    namespace: str,
+    *,
+    allow_merged: bool = False,
+    require_simple_text: bool = True,
 ) -> str | None:
     """Admit a complete rectangular grid, retaining merge markup during resize."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return "table_column_table_unsupported"
     tbl_grid = table.find(word("tblGrid"))
@@ -327,12 +342,16 @@ def _table_hazard_reason(
                 return "table_column_merge_markup_invalid"
             if v_mode is not None:
                 vertical.add(interval)
-            if _simple_text_node(cell, namespace) is None and not (
-                allow_merged
-                and properties is not None
-                and any(
-                    properties.find(word(name)) is not None
-                    for name in ("gridSpan", "hMerge", "vMerge")
+            if (
+                require_simple_text
+                and _simple_text_node(cell, namespace) is None
+                and not (
+                    allow_merged
+                    and properties is not None
+                    and any(
+                        properties.find(word(name)) is not None
+                        for name in ("gridSpan", "hMerge", "vMerge")
+                    )
                 )
             ):
                 return "table_column_structure_unsupported"
@@ -398,8 +417,7 @@ def _column_structure_fingerprint(
     table: ET.Element, column: int, namespace: str, *, part: str = _DOCUMENT
 ) -> str:
     """Hash the selected column's XML structure across tblGrid and every row, masking cell text."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     col_idx = column - 1
     tbl_grid = table.find(word("tblGrid"))
     assert tbl_grid is not None
@@ -439,13 +457,15 @@ def table_column_structure_fingerprint(
         ns = _word_namespace(root)
         if ns is None:
             return None
-        def word(local):
-            return Q(ns, local)
+        word = lambda local: Q(ns, local)
         tables = list(root.iter(word("tbl")))
         if table < 1 or table > len(tables):
             return None
         target_table = tables[table - 1]
-        if _table_hazard_reason(target_table, ns, allow_merged=True) is not None:
+        if (
+            _table_hazard_reason(target_table, ns, allow_merged=True, require_simple_text=False)
+            is not None
+        ):
             return None
         tbl_grid = target_table.find(word("tblGrid"))
         if tbl_grid is None:
@@ -832,7 +852,10 @@ def discover_table_column_targets(
             continue
         if not _is_supported_table(table, namespace):
             continue
-        if _table_hazard_reason(table, namespace, allow_merged=True) is not None:
+        if (
+            _table_hazard_reason(table, namespace, allow_merged=True, require_simple_text=False)
+            is not None
+        ):
             continue
 
         tbl_grid = table.find(Q(namespace, "tblGrid"))
@@ -851,11 +874,16 @@ def discover_table_column_targets(
 
         row_context_blocked = any(
             unsupported_context.get(id(row), False)
-            or not _is_approved_row(row, namespace, allow_merged=True)
+            or not _is_approved_row(row, namespace, allow_merged=True, require_simple_text=False)
             for row in rows
         )
         if row_context_blocked:
             continue
+        # Insert and delete rebuild cells, so they stay limited to unmerged one-run text cells;
+        # resize rewrites only widths and is offered for every admitted table.
+        rebuildable = not merged and all(
+            _is_approved_row(row, namespace, allow_merged=False) for row in rows
+        )
 
         for col_idx in range(1, num_cols + 1):
             grid_col = grid_cols[col_idx - 1]
@@ -874,10 +902,12 @@ def discover_table_column_targets(
                 cell_texts.append("".join(node.text or "" for node in cell.iter(Q(namespace, "t"))))
 
             fp = _column_structure_fingerprint(table, col_idx, namespace, part=part)
-            can_delete = num_cols > 1
-            actions = (
-                ("resize",) if merged else (("insert", "delete") if can_delete else ("insert",))
-            )
+            if not rebuildable:
+                actions: tuple[str, ...] = ("resize",)
+            elif num_cols > 1:
+                actions = ("insert", "delete", "resize")
+            else:
+                actions = ("insert", "resize")
 
             target = TableColumnTarget(
                 table=table_idx,
@@ -913,8 +943,7 @@ def _resize_table_column(
     namespace: str,
 ) -> TableColumnReport:
     """Set one admitted column's grid and cell widths while keeping every cell's content intact."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     width = request.width
     assert width is not None
     col_idx = request.column - 1
@@ -1129,8 +1158,7 @@ def author_table_column(request: TableColumnRequest) -> TableColumnReport:
         return _table_column_refusal(request, "table_column_namespace_unsupported")
 
     unsupported_context = _unsupported_context_by_element(root, namespace)
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tables = list(root.iter(word("tbl")))
 
     if request.table < 1 or request.table > len(tables):
@@ -1140,7 +1168,10 @@ def author_table_column(request: TableColumnRequest) -> TableColumnReport:
     if unsupported_context.get(id(table), False):
         return _table_column_refusal(request, "table_column_context_unsupported")
 
-    hazard = _table_hazard_reason(table, namespace, allow_merged=request.action == "resize")
+    resize = request.action == "resize"
+    hazard = _table_hazard_reason(
+        table, namespace, allow_merged=resize, require_simple_text=not resize
+    )
     if hazard is not None:
         target = request.target_dict()
         for r_idx, row in enumerate(table.findall(word("tr")), start=1):

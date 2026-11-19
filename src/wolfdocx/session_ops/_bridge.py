@@ -98,6 +98,38 @@ def refused(operation: str, code: str) -> SessionEditReport:
 class EditHost:
     """Session hooks the edit mixins rely on; :class:`~wolfdocx.Document` provides them."""
 
+    def _edit_paragraph(self, paragraph: int, part: str, **fields: object) -> SessionEditReport:
+        """Apply the paragraph planner to the session's current part in memory."""
+        raise NotImplementedError
+
+    def _materialize(self) -> bytes:
+        raise NotImplementedError
+
+    def _adopt(self, operation: str, edited: bytes, detail: Mapping[str, Any]) -> SessionEditReport:
+        raise NotImplementedError
+
+    def _snapshot(self) -> object:
+        raise NotImplementedError
+
+    def _restore(self, snapshot: object) -> None:
+        raise NotImplementedError
+
+    def _edit_part(
+        self,
+        operation: str,
+        part: str,
+        plan: Callable[[Any, Callable[[str], Any]], tuple[bytes, Any] | str],
+        *,
+        failure_code: str,
+        detail: Mapping[str, Any],
+    ) -> SessionEditReport:
+        """Apply ``plan(graph, load)`` to one part in memory.
+
+        ``plan`` returns the part's new bytes and the tree they must re-parse to, or
+        a refusal code; ``failure_code`` refuses bytes that do not re-parse to it.
+        """
+        raise NotImplementedError
+
     def _apply_operation(
         self,
         operation: str,

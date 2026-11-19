@@ -8,8 +8,13 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 
+from ._optional import feature_module
+
 if TYPE_CHECKING:
     from .document import Document
+
+    _feature_fields = feature_module("fields")
+    Field = _feature_fields.Field
 
 
 @dataclass(frozen=True)
@@ -720,7 +725,7 @@ class Node:
             if name not in builtins:
                 raise NodeEditError("node_path_function_unsupported")
         try:
-            from lxml import etree
+            etree = feature_module("_commercial_features").xpath_backend()
         except ImportError as exc:
             raise NodeEditError("node_path_dependency_missing") from exc
         from .inspect import serialize_xml_with_preserved_qnames
@@ -842,16 +847,97 @@ class Node:
         return text
 
     def to_string(self, save_format: str = "txt") -> str:
-        """Return plain text or the node's XML representation."""
+        """Convert through text, XML or the existing HTML/Markdown exporter.
+
+        Binary save formats are not strings. Unsupported layout/content stays a
+        typed refusal, including Markdown exports with named omissions.
+        """
         if save_format == "txt":
             return self.get_text().replace("\r", "\n").replace("\x07", "\t")
         if save_format == "xml" and self._element is not None:
             from .inspect import serialize_xml_with_preserved_qnames
 
             return serialize_xml_with_preserved_qnames(self._element).decode("utf-8")
+        if save_format in {"html", "md"}:
+            return self._export_string(save_format)
         raise NodeEditError("node_string_format_unsupported")
 
-    
+    def _export_string(self, save_format: str) -> str:
+        import tempfile
+        from pathlib import Path
+
+        from .assembly import NodeImporter
+        from .document import Document
+
+        _feature_html_export = feature_module("html_export")
+        HtmlExportError = _feature_html_export.HtmlExportError
+        docx_to_html = _feature_html_export.docx_to_html
+        _feature_markdown = feature_module("markdown")
+        docx_to_markdown_report = _feature_markdown.docx_to_markdown_report
+
+        if self.document is None:
+            raise NodeEditError("node_edit_unbound")
+        if self._edit is not None and self.node_type != NodeType.DOCUMENT:
+            self._edit("check", self, self, 0)
+        export = Document.from_bytes(
+            self.document._materialize(),
+            path="node-export.docx",
+            limits=self.document._graph.limits,
+        )
+        try:
+            if self.node_type != NodeType.DOCUMENT:
+                body = export.get_story(StoryType.BODY)
+                body.remove_all_children()
+                importer = NodeImporter(self.document, export)
+                sources = tuple(self.children) if self.node_type == NodeType.STORY else (self,)
+                for source in sources:
+                    if source.node_type == NodeType.SECTION:
+                        continue
+                    imported = importer.import_node(source)
+                    local = imported.xml_name.rpartition("}")[2]
+                    ns = export.get_story(StoryType.BODY).xml_name[1:].partition("}")[0]
+                    if local not in {"p", "tbl", "sdt", "customXml"}:
+                        wrappers = {
+                            "tr": ("tbl",),
+                            "tc": ("tbl", "tr"),
+                            "drawing": ("p", "r"),
+                            "pict": ("p", "r"),
+                            "object": ("p", "r"),
+                            "oMath": ("p",),
+                            "oMathPara": ("p",),
+                            "r": ("p",),
+                            "hyperlink": ("p",),
+                            "fldSimple": ("p",),
+                            "smartTag": ("p",),
+                        }.get(local)
+                        if wrappers is None:
+                            raise NodeEditError("node_string_content_unsupported")
+                        element = imported._element
+                        for wrapper in reversed(wrappers):
+                            parent = ET.Element(f"{{{ns}}}{wrapper}")
+                            parent.append(element)
+                            element = parent
+                        snapshot = export.node
+                        assert snapshot._bind is not None
+                        imported = snapshot._bind(element, "word/document.xml", StoryType.BODY)
+                    export.get_story(StoryType.BODY).append_child(imported)
+            with tempfile.TemporaryDirectory(prefix="wolfdocx-node-export-") as directory:
+                source = Path(directory) / "node.docx"
+                report = export.save(source)
+                if not report.passed:
+                    raise NodeEditError(report.code or "node_string_export_failed")
+                if save_format == "html":
+                    return docx_to_html(source)
+                converted = docx_to_markdown_report(source)
+                if converted.omissions:
+                    raise NodeEditError("node_string_export_omitted")
+                return converted.markdown
+        except (HtmlExportError, ValueError) as exc:
+            if isinstance(exc, NodeEditError):
+                raise
+            raise NodeEditError("node_string_content_unsupported") from exc
+        finally:
+            export.close()
 
     def set_text(self, text: str) -> None:
         """Replace one story's content with plain paragraphs, retaining its identity."""
@@ -958,10 +1044,14 @@ class Node:
 
 
 class FieldCharacter(Node):
-    """A complex field marker with navigation and read-only character flags.
+    """A complex field marker in the generic tree, not a second live-field handle.
 
-    Field instructions and cached text remain opaque package content. Clone,
-    navigation, visitors and structural mutation use the normal Node API.
+    ``field`` / ``get_field()`` return the existing immutable ``fields.Field``
+    snapshot; ``instruction`` and ``result`` expose its code and cached display.
+    ``dirty`` and ``locked`` are this character's flags, not aggregate flags.
+    Clone, navigation, visitors and structural mutation use the normal Node API.
+    Incomplete field sequences refuse atomically at the existing structural gate.
+    Instruction/result/flag setters remain on ``fields.LiveFieldCollection`` handles.
     """
 
     @property
@@ -988,13 +1078,68 @@ class FieldCharacter(Node):
     def locked(self) -> bool:
         return self._field_flag("fldLock")
 
-    
+    def get_field(self) -> Field:
+        """Resolve this marker in its current story or detached subtree."""
+        _feature_fields = feature_module("fields")
+        Field = _feature_fields.Field
+        FieldStructureError = _feature_fields.FieldStructureError
+        _cached_text = _feature_fields._cached_text
+        _PartContext = _feature_fields._PartContext
+        field_nodes = _feature_fields.field_nodes
 
-    
+        if self._edit is not None:
+            self._edit("check", self, self, 0)
+        scope: Node = self
+        while scope.parent is not None and scope.node_type != NodeType.STORY:
+            if scope.parent._element is None:
+                break
+            scope = scope.parent
+        if scope._element is None:
+            raise NodeEditError("node_field_incomplete")
+        namespace = scope._element.tag[1:].partition("}")[0]
+        try:
+            fields = field_nodes(
+                scope._element,
+                namespace,
+                part=self.part or "",
+                allow_instruction_nesting=True,
+            )
+            item = next(
+                (
+                    field
+                    for field in fields
+                    if self._element is field.begin
+                    or self._element is field.separate
+                    or self._element is field.end
+                ),
+                None,
+            )
+            if item is None:
+                raise NodeEditError("node_field_incomplete")
+            context = _PartContext.build(self.part or "", scope._element, namespace)
+            return Field(
+                start=ET.tostring(item.begin),
+                separator=ET.tostring(item.separate) if item.separate is not None else None,
+                end=ET.tostring(item.end) if item.end is not None else None,
+                type=item.code,
+                code=item.instruction,
+                result=_cached_text(context, item),
+                depth=item.depth,
+            )
+        except FieldStructureError as error:
+            raise NodeEditError(error.code) from error
 
-    
+    @property
+    def field(self) -> Field:
+        return self.get_field()
 
-    
+    @property
+    def instruction(self) -> str:
+        return self.field.code
+
+    @property
+    def result(self) -> str:
+        return self.field.result
 
 
 class FieldStart(FieldCharacter):

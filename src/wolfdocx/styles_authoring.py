@@ -8,6 +8,8 @@ Refuses unsupported or invalid operations:
 - Malformed requests (unknown keys, missing required fields, invalid types).
 - Incompatible style types (e.g. numbering styles).
 - Duplicate style IDs on creation; missing target styles on update.
+- A name another style already uses (compared case-insensitively, as Word does) on
+  creation or rename.
 - Missing referenced base or next styles, or incompatible reference types.
 - Inheritance and next-style cycles detected via graph semantics.
 - Stale source hashes or structure fingerprints.
@@ -441,8 +443,7 @@ def _validate_script_properties(value: Mapping[str, Any], *, paragraph: bool) ->
 def _write_script_properties(
     parent: ET.Element, properties: Mapping[str, Any], namespace: str, *, paragraph: bool
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     flags = _SCRIPT_PARAGRAPH_FLAGS if paragraph else _SCRIPT_RUN_FLAGS
     for key, tag in flags.items():
         if properties.get(key) is not None:
@@ -503,8 +504,7 @@ def _read_script_properties(
 ) -> dict[str, Any]:
     if parent is None:
         return {}
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     result: dict[str, Any] = {}
     flags = _SCRIPT_PARAGRAPH_FLAGS if paragraph else _SCRIPT_RUN_FLAGS
     for key, tag in flags.items():
@@ -1365,8 +1365,7 @@ def style_structure_fingerprint(
         _word_namespace(styles_root)
         or "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     )
-    def word(local):
-        return Q(ns, local)
+    word = lambda local: Q(ns, local)
     for style_elem in styles_root.findall(word("style")):
         sid = style_elem.get(word("styleId")) or style_elem.get("styleId")
         if sid == style_id:
@@ -1515,8 +1514,7 @@ def discover_style_targets(source: str | Path, *, part: str = _STYLES) -> dict[s
         _word_namespace(styles_root)
         or "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     )
-    def word(local):
-        return Q(ns, local)
+    word = lambda local: Q(ns, local)
 
     root_fp = _element_structure_fingerprint(styles_root)
     try:
@@ -1647,8 +1645,7 @@ def _apply_style_paragraph_properties(
     properties: Mapping[str, Any],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     ppr = style_elem.find(word("pPr"))
     if ppr is None:
         ppr = ET.Element(word("pPr"))
@@ -1731,8 +1728,7 @@ def _apply_style_run_properties(
     properties: Mapping[str, Any],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     rpr = style_elem.find(word("rPr"))
     if rpr is None:
         rpr = ET.Element(word("rPr"))
@@ -1831,8 +1827,7 @@ def _apply_style_table_properties(
     properties: Mapping[str, Any],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tbl_pr = style_elem.find(word("tblPr"))
     if tbl_pr is None:
         tbl_pr = ET.Element(word("tblPr"))
@@ -1909,8 +1904,7 @@ def _apply_style_cell_properties(
     properties: Mapping[str, Any],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tc_pr = style_elem.find(word("tcPr"))
     if tc_pr is None:
         tc_pr = ET.Element(word("tcPr"))
@@ -1997,8 +1991,7 @@ def _apply_style_row_properties(
     properties: Mapping[str, Any],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tr_pr = style_elem.find(word("trPr"))
     if tr_pr is None:
         tr_pr = ET.Element(word("trPr"))
@@ -2037,8 +2030,7 @@ def _apply_style_conditional_formatting(
     conditional_formatting: Sequence[Mapping[str, Any]],
     namespace: str,
 ) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
 
     existing_by_type: dict[str, ET.Element] = {}
     for elem in list(style_elem.findall(word("tblStylePr"))):
@@ -2197,8 +2189,7 @@ def author_style(request: StyleRequest) -> StyleReport:
         styles_ns = main_ns
         styles_root = ET.Element(Q(styles_ns, "styles"))
 
-    def styles_word(local):
-        return Q(styles_ns, local)
+    styles_word = lambda local: Q(styles_ns, local)
 
     # Verify structural fingerprint
     current_root_fp = (
@@ -2295,6 +2286,18 @@ def author_style(request: StyleRequest) -> StyleReport:
         refs = _find_style_references(parts, request.style_id, styles_root, styles_ns)
         if refs:
             return _style_refusal(request, "style_in_use")
+    # Word keeps one style per name and may rename later duplicates on open (ECMA-376
+    # 17.7.4.9), so a create or rename onto another style's name is refused.
+    if request.action != "delete" and request.name is not None:
+        renames = (
+            request.action == "create" or existing_styles[request.style_id]["name"] != request.name
+        )
+        requested_name = request.name.casefold()
+        if renames and any(
+            sid != request.style_id and (info["name"] or "").casefold() == requested_name
+            for sid, info in existing_styles.items()
+        ):
+            return _style_refusal(request, "style_name_duplicate")
     # A linked pair names each other through w:link; the request's companion gains the
     # reciprocal link, and an update that re-pairs releases the previous companion.
     backlink_companion: str | None = None
@@ -2582,8 +2585,7 @@ def author_style(request: StyleRequest) -> StyleReport:
             return "style_staged_verification_failed"
 
         s_ns = _word_namespace(staged_root) or styles_ns
-        def s_word(local):
-            return Q(s_ns, local)
+        s_word = lambda local: Q(s_ns, local)
 
         matching = [
             s

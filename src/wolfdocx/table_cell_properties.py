@@ -39,6 +39,7 @@ from .table_properties import (
     TableShadingSpec,
     TableWidthSpec,
     _check_reachable_part,
+    _native_render_supported,
     _unrelated_parts_preserved,
 )
 
@@ -224,8 +225,7 @@ def _vertical_merge_origin(tc_pr: ET.Element | None, namespace: str) -> bool:
 def _insert_or_replace_tcpr_child(tc_pr: ET.Element, new_child: ET.Element, namespace: str) -> None:
     """Insert or replace a child element in tcPr while strictly maintaining schema order."""
     local_name = new_child.tag.rsplit("}", 1)[-1]
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for existing in list(tc_pr.findall(word(local_name))):
         tc_pr.remove(existing)
     try:
@@ -567,6 +567,7 @@ class TableCellPropertiesTarget:
     cell: int
     structure_fingerprint_sha256: str
     part: str = _DOCUMENT
+    native_table_cell_properties_render_supported: bool = True
     current_properties: dict[str, Any] | None = None
 
     @property
@@ -585,6 +586,9 @@ class TableCellPropertiesTarget:
             "cell": self.cell,
             "part": self.part,
             "structure_fingerprint_sha256": self.structure_fingerprint_sha256,
+            "native_table_cell_properties_render_supported": (
+                self.native_table_cell_properties_render_supported
+            ),
             "current_properties": self.current_properties,
         }
 
@@ -678,6 +682,7 @@ class TableCellPropertiesReport:
     destination_sha256: str | None = None
     target: dict[str, Any] | None = None
     properties: dict[str, Any] | None = None
+    native_table_cell_properties_render_supported: bool | None = None
     target_change_report: dict[str, Any] | None = None
     non_target_parts_preserved: bool | None = None
 
@@ -696,6 +701,9 @@ class TableCellPropertiesReport:
             "destination_sha256": self.destination_sha256,
             "target": self.target,
             "properties": self.properties,
+            "native_table_cell_properties_render_supported": (
+                self.native_table_cell_properties_render_supported
+            ),
             "target_change_report": self.target_change_report,
             "non_target_parts_preserved": self.non_target_parts_preserved,
         }
@@ -713,6 +721,7 @@ def _table_cell_properties_refusal(
         destination_sha256=None,
         target=target if target is not None else request.target_dict(),
         properties=request.properties_dict(),
+        native_table_cell_properties_render_supported=None,
         target_change_report=None,
         non_target_parts_preserved=None,
     )
@@ -760,8 +769,7 @@ def _inspect_table_cell_properties(tc_pr: ET.Element | None, namespace: str) -> 
     if tc_pr is None:
         return {}
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     result: dict[str, Any] = {}
 
     tc_w = tc_pr.find(word("tcW"))
@@ -854,8 +862,7 @@ def _inspect_cell_context(
     parent_map: dict[ET.Element, ET.Element] | None = None,
 ) -> str | None:
     """Return refusal code if table cell is in unsupported context, else None."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
 
     # 1. Unsupported context (e.g. inside w:sdt, w:ins, w:del, comments, headers/footers)
     if (
@@ -913,6 +920,84 @@ def _inspect_cell_context(
     return None
 
 
+def _native_render_supported_cell(
+    cell: ET.Element,
+    table: ET.Element,
+    graph: PackageGraph,
+    namespace: str,
+) -> bool:
+    """Determine whether native layout engine natively supports this cell's properties."""
+    word = lambda local: Q(namespace, local)
+
+    # First check table level
+    if not _native_render_supported(table, graph, namespace):
+        return False
+
+    tc_pr = cell.find(word("tcPr"))
+    if tc_pr is not None and any(
+        tc_pr.find(word(tag)) is not None for tag in ("tcFitText", "hideMark", "cnfStyle")
+    ):
+        return False
+    if tc_pr is not None:
+        # vAlign must be 'top', 'center', or 'bottom' (native_layout.py)
+        valign = tc_pr.find(word("vAlign"))
+        if valign is not None:
+            v_val = (valign.get(word("val")) or "top").strip().lower()
+            if v_val not in {"top", "center", "bottom"}:
+                return False
+
+        # textDirection is unsupported in native layout (native_layout.py:4573-4574)
+        if tc_pr.find(word("textDirection")) is not None:
+            return False
+
+        # Borders must be 'single' or 'thick' (or none/nil) (native_layout.py:4666-4667)
+        borders_elem = tc_pr.find(word("tcBorders"))
+        if borders_elem is not None:
+            if any(borders_elem.find(word(side)) is not None for side in ("start", "end")):
+                return False
+            for b in borders_elem:
+                val = b.get(word("val"))
+                if val is not None and val.strip().lower() not in {
+                    "single",
+                    "thick",
+                    "none",
+                    "nil",
+                }:
+                    return False
+
+        # Cell margins width check: content_width = width - margin[1] - margin[3] > 0
+        mar_elem = tc_pr.find(word("tcMar"))
+        w_elem = tc_pr.find(word("tcW"))
+        if mar_elem is not None and w_elem is not None:
+            raw_w = w_elem.get(word("w"))
+            if raw_w and raw_w.isdigit():
+                cell_w = int(raw_w)
+                left_mar = 0
+                right_mar = 0
+                left_el = mar_elem.find(word("left"))
+                if left_el is not None:
+                    lw = left_el.get(word("w"))
+                    if lw and lw.isdigit():
+                        left_mar = int(lw)
+                right_el = mar_elem.find(word("right"))
+                if right_el is not None:
+                    rw = right_el.get(word("w"))
+                    if rw and rw.isdigit():
+                        right_mar = int(rw)
+                if cell_w - left_mar - right_mar <= 0:
+                    return False
+
+    # Check cell contents: only paragraphs allowed
+    for child in cell:
+        tag_local = child.tag.rsplit("}", 1)[-1]
+        if tag_local == "tcPr":
+            continue
+        if tag_local != "p":
+            return False
+
+    return True
+
+
 def table_cell_properties_structure_fingerprint(
     source: str | Path,
     *,
@@ -934,8 +1019,7 @@ def table_cell_properties_structure_fingerprint(
         ns = _word_namespace(root)
         if ns is None:
             return None
-        def word(local):
-            return Q(ns, local)
+        word = lambda local: Q(ns, local)
         tables = list(root.iter(word("tbl")))
         if table < 1 or table > len(tables):
             return None
@@ -1048,8 +1132,7 @@ def discover_table_cell_properties_targets(
             "unsupported": [],
         }
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     unsupported_context = _unsupported_context_by_element(root, namespace)
     parent_map = {c: p for p in root.iter() for c in p}
     tables = list(root.iter(word("tbl")))
@@ -1083,6 +1166,7 @@ def discover_table_cell_properties_targets(
                     continue
 
                 fp = _cell_structure_fingerprint(cell)
+                native_supported = _native_render_supported_cell(cell, table, graph, namespace)
                 tc_pr = cell.find(word("tcPr"))
                 current_props = _inspect_table_cell_properties(tc_pr, namespace)
 
@@ -1092,6 +1176,7 @@ def discover_table_cell_properties_targets(
                     cell=cell_idx,
                     part=part,
                     structure_fingerprint_sha256=fp,
+                    native_table_cell_properties_render_supported=native_supported,
                     current_properties=current_props,
                 )
                 targets.append(target.to_dict())
@@ -1112,7 +1197,45 @@ def discover_table_cell_properties_targets(
 def author_table_cell_properties(
     request: TableCellPropertiesRequest,
 ) -> TableCellPropertiesReport:
-    """Author direct formatting table cell properties on an exact body cell atomically."""
+    """Set cell-level width, vertical alignment, shading, borders, and cell margins as direct
+    formatting on one bound table cell and publish one verified package. The request binds the
+    source digest, the cell target with its structure fingerprint, and the explicit properties
+    to set - width with its measure type, vertical alignment of `top`, `center`, `both`, or
+    `bottom`, shading, per-side borders, and cell margins; properties the request does not name
+    keep their existing values, the cell's text and its existing property children are preserved
+    in schema order, and table-wide values keep their own precedence.
+
+    A merged cell (`vMerge`, `hMerge`, or `gridSpan`), a nested table, a duplicated or ambiguous
+    property element, a table, row, or cell inside a content control, tracked revision, comment,
+    or drawing context, a row with property exceptions or grid offsets, a stale source digest or
+    fingerprint, an occupied destination, and a part other than `word/document.xml` all refuse
+    with no output file. The native renderer's cell-property support is narrower than the
+    authored set - discovery reports `native_table_cell_properties_render_supported=false` for a
+    cell it cannot draw - and authoring accepts valid properties independently of that flag,
+    making no Microsoft Word rendering-parity claim. Every part the request does not own must
+    remain byte-identical to the source.
+
+    Render top, center, and bottom cell alignment using resolved cell margins and row or
+    vertical-merge region heights. Direct cell alignment takes precedence over table-style
+    defaults. Shift cell content and paragraph decorations together while retaining full-cell
+    shading and border bounds. Preserve top-aligned slicing for rows split across pages; other
+    alignment values and vertical cell text remain explicit native rendering refusals.
+
+    Set `no_wrap=true` to author `w:noWrap` or `no_wrap=false` for explicit `w:val=off`; omit
+    the property or use null to preserve its declaration. Native layout honors direct cell
+    values over table-style defaults and preserves explicit line breaks. AutoFit columns use
+    measured content widths, redistributing sibling space before growing the table and forcing
+    breaks at the available-width limit. For `tcW` of type `dxa`, including zero, ordinary soft
+    wrapping remains enabled. Fixed-layout overflow retains its typed refusal. See [native
+    AutoFit geometry](features/p4-feature-docx-cell-no-wrap-overflow-layout.md) for the
+    specification-derived contract and qualification boundary; no general Microsoft Word visual-
+    equivalence claim is made.
+
+    An authored table grid alone does not constrain line wrapping: omitted `w:tblLayout` uses
+    AutoFit, which may widen a cell to fit an unbroken word. Use `w:tblLayout w:type="fixed"`
+    when a fixed grid width must force wrapping, including dictionary-based automatic
+    hyphenation.
+    """
     if not isinstance(request, TableCellPropertiesRequest):
         raise TypeError("table_cell_properties_request_invalid")
 
@@ -1165,8 +1288,7 @@ def author_table_cell_properties(
             request, "table_cell_properties_namespace_unsupported"
         )
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tables = list(root.iter(word("tbl")))
 
     if request.table < 1 or request.table > len(tables):
@@ -1349,6 +1471,7 @@ def author_table_cell_properties(
             cnf.set(word(attr), value if attr == "val" else ("1" if value else "0"))
         _insert_or_replace_tcpr_child(tc_pr, cnf, namespace)
 
+    native_supported = _native_render_supported_cell(target_cell, target_table, graph, namespace)
     properties_after = _inspect_table_cell_properties(tc_pr, namespace)
 
     target_change_report: dict[str, Any] = {
@@ -1359,6 +1482,7 @@ def author_table_cell_properties(
         "properties_authored": authored_keys,
         "properties_before": properties_before,
         "properties_after": properties_after,
+        "native_table_cell_properties_render_supported": native_supported,
         "boundaries": {
             "table": request.table,
             "row": request.row,
@@ -1453,6 +1577,7 @@ def author_table_cell_properties(
         destination_sha256=destination_sha256,
         target=request.target_dict(),
         properties=request.properties_dict(),
+        native_table_cell_properties_render_supported=native_supported,
         target_change_report=target_change_report,
         non_target_parts_preserved=True,
     )

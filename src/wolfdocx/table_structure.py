@@ -183,8 +183,7 @@ def _row_repeat_header(row: ET.Element, namespace: str) -> bool:
 def _is_copy_safe_cell(cell: ET.Element, namespace: str) -> bool:
     """True if a cell can be cloned without treating its nested blocks as text."""
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     properties = cell.find(word("tcPr"))
     if properties is not None and any(
         properties.find(word(name)) is not None for name in ("vMerge", "hMerge", "gridSpan")
@@ -213,8 +212,7 @@ def _is_copy_safe_cell(cell: ET.Element, namespace: str) -> bool:
 def _is_approved_row(row: ET.Element, namespace: str) -> bool:
     """True if an unmerged row has a safe copy surface."""
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("trPr"), word("tc")} for child in row):
         return False
     cells = row.findall(word("tc"))
@@ -226,8 +224,7 @@ def _is_approved_row(row: ET.Element, namespace: str) -> bool:
 
 def _is_supported_table(table: ET.Element, namespace: str) -> bool:
     """True if table has supported body table structure."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return False
     rows = table.findall(word("tr"))

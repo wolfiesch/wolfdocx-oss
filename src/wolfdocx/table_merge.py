@@ -191,8 +191,7 @@ def _has_forbidden_cell_descendant(element: ET.Element) -> bool:
 
 def _cell_has_user_content(cell: ET.Element, namespace: str) -> bool:
     """Return True if the cell contains user text, whitespace, control characters, or non-text payload."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for t_node in cell.iter(word("t")):
         if t_node.text is not None and len(t_node.text) > 0:
             return True
@@ -205,8 +204,7 @@ def _cell_has_user_content(cell: ET.Element, namespace: str) -> bool:
 
 def _get_cell_text(cell: ET.Element, namespace: str) -> str:
     """Extract plain text from all w:t descendants in the cell."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     texts: list[str] = []
     for t_node in cell.iter(word("t")):
         if t_node.text:
@@ -227,8 +225,7 @@ def _cell_structure_projection(element: ET.Element) -> list[Any]:
 
 def _is_supported_table(table: ET.Element, namespace: str) -> bool:
     """True if table has supported body table structure with explicit grid columns."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return False
     tbl_grid = table.find(word("tblGrid"))
@@ -246,8 +243,7 @@ def _cell_hmerge_mode(cell: ET.Element, namespace: str) -> str | None:
 
     Raises ValueError on duplicate or invalid hMerge markup.
     """
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tc_pr = cell.find(word("tcPr"))
     if tc_pr is None:
         return None
@@ -272,8 +268,7 @@ def _cell_malformed_reason(
     A legacy hMerge is reported as ``hMerge_unsupported`` unless ``legacy_hmerge`` admits it,
     in which case it must be a well-formed, single-column marker.
     """
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tc_pr = cell.find(word("tcPr"))
     if tc_pr is None:
         return None
@@ -337,8 +332,7 @@ def _row_grid_mapping(
 
     Returns None if the row's cells do not cleanly partition the grid columns.
     """
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     cells = row.findall(word("tc"))
     if not cells:
         return None
@@ -382,8 +376,7 @@ def _cell_merge_state(
     v_merge_mode is 'restart', 'continue', or None.
     Raises ValueError on malformed or duplicate merge markup.
     """
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tc_pr = cell.find(word("tcPr"))
     if tc_pr is None:
         return 1, None
@@ -425,8 +418,7 @@ def _cell_merge_state(
 def _insert_or_replace_tcpr_child(tc_pr: ET.Element, new_child: ET.Element, namespace: str) -> None:
     """Insert or replace a child element in tcPr while maintaining schema order."""
     local_name = new_child.tag.rsplit("}", 1)[-1]
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for existing in list(tc_pr.findall(word(local_name))):
         tc_pr.remove(existing)
     try:
@@ -448,15 +440,13 @@ def _insert_or_replace_tcpr_child(tc_pr: ET.Element, new_child: ET.Element, name
 
 def _remove_tcpr_child(tc_pr: ET.Element, local_name: str, namespace: str) -> None:
     """Remove any child matching local_name from tcPr."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for child in list(tc_pr.findall(word(local_name))):
         tc_pr.remove(child)
 
 
 def _set_tc_width(tc_pr: ET.Element, width_val: int | str, namespace: str) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tc_w = ET.Element(word("tcW"))
     tc_w.set(word("w"), str(width_val))
     tc_w.set(word("type"), "dxa")
@@ -464,16 +454,14 @@ def _set_tc_width(tc_pr: ET.Element, width_val: int | str, namespace: str) -> No
 
 
 def _set_grid_span(tc_pr: ET.Element, span: int, namespace: str) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     gs = ET.Element(word("gridSpan"))
     gs.set(word("val"), str(span))
     _insert_or_replace_tcpr_child(tc_pr, gs, namespace)
 
 
 def _set_v_merge(tc_pr: ET.Element, mode: str, namespace: str) -> None:
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     vm = ET.Element(word("vMerge"))
     if mode == "restart":
         vm.set(word("val"), "restart")
@@ -486,8 +474,7 @@ def _create_split_cell(
     namespace: str,
 ) -> ET.Element:
     """Create a new per-grid cell inheriting applicable properties without merge attributes."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     new_tc = ET.Element(word("tc"))
     new_tc_pr = ET.SubElement(new_tc, word("tcPr"))
     if width_val is not None:
@@ -830,8 +817,19 @@ def discover_table_merge_targets(
     source: str | Path,
     *,
     part: str = _DOCUMENT,
+    target: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Inventory source-bound candidate table cell merge and split targets for authoring."""
+    """Inventory source-bound candidate table cell merge and split targets for authoring.
+
+    Without ``target`` the inventory lists every existing merged region (split targets) and
+    every adjacent same-row pair whose second cell is empty (merge targets). Pass ``target``
+    (``table``, ``start_row``, ``end_row``, ``start_col``, ``end_col``) to bind one explicit
+    rectangle instead, such as a vertical or multi-row merge: the result then carries that
+    single eligible target with its structure fingerprint, or a refusal whose ``conflict``
+    names the exact row and cell that blocks the merge.
+    """
+    if target is not None:
+        return _query_table_merge_target(Path(source), part=part, target=target)
     path = Path(source)
     if not path.is_file():
         return {
@@ -1112,6 +1110,131 @@ def discover_table_merge_targets(
     }
 
 
+_COORDINATES = ("table", "start_row", "end_row", "start_col", "end_col")
+
+
+def _query_table_merge_target(
+    path: Path, *, part: str, target: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind one explicit rectangle: the listed target, a new merge target, or a refusal."""
+
+    def result(
+        code: str | None,
+        source_sha256: str | None,
+        query: dict[str, Any] | None,
+        targets: list[dict[str, Any]],
+        conflict: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "operation": "table-merge-targets",
+            "passed": code is None,
+            "status": "discovered" if code is None else _REFUSED,
+            "code": code,
+            "source_sha256": source_sha256,
+            "part": part,
+            "query": query,
+            "conflict": conflict,
+            "targets": targets,
+        }
+
+    if not isinstance(target, Mapping):
+        return result("table_merge_target_invalid", None, None, [])
+    try:
+        query = _validate_table_merge_target_dict({"part": part, **target})
+    except (TypeError, ValueError) as error:
+        return result(str(error), None, None, [])
+    part = query["part"]
+
+    inventory = discover_table_merge_targets(path, part=part)
+    if not inventory["passed"]:
+        return result(inventory["code"], inventory["source_sha256"], query, [])
+    source_sha256 = inventory["source_sha256"]
+    listed = [t for t in inventory["targets"] if all(t[k] == query[k] for k in _COORDINATES)]
+    if listed:
+        return result(None, source_sha256, query, listed)
+
+    # Not an existing merged region or listed pair: evaluate it as a new merge rectangle.
+    root = ET.fromstring(PackageGraph.from_file(path).read_part_bytes(part))
+    namespace = _word_namespace(root)
+    assert namespace is not None  # the inventory above already admitted the part
+    tables = list(root.iter(Q(namespace, "tbl")))
+    if query["table"] > len(tables):
+        return result("table_merge_target_missing", source_sha256, query, [])
+    table = tables[query["table"] - 1]
+    unsupported_context = _unsupported_context_by_element(root, namespace)
+    rows = table.findall(Q(namespace, "tr"))
+    if unsupported_context.get(id(table), False) or any(
+        unsupported_context.get(id(row), False) for row in rows
+    ):
+        return result("table_merge_context_unsupported", source_sha256, query, [])
+    if not _is_supported_table(table, namespace):
+        return result("table_merge_table_unsupported", source_sha256, query, [])
+    tbl_grid = table.find(Q(namespace, "tblGrid"))
+    assert tbl_grid is not None  # _is_supported_table requires the grid
+    grid_cols = tbl_grid.findall(Q(namespace, "gridCol"))
+    if query["end_row"] > len(rows) or query["end_col"] > len(grid_cols):
+        return result("table_merge_target_missing", source_sha256, query, [])
+    for r_idx, row in enumerate(rows, start=1):
+        for ordinal, cell in enumerate(row.findall(Q(namespace, "tc")), start=1):
+            reason = _cell_malformed_reason(cell, namespace)
+            if reason is not None:
+                conflict = {"reason": reason, "row": r_idx, "cell": ordinal}
+                return result(
+                    "table_merge_structure_unsupported", source_sha256, query, [], conflict
+                )
+    entries: list[list[tuple[int, ET.Element, int, int]]] = []
+    for row in rows:
+        mapping = _row_grid_mapping(row, len(grid_cols), namespace)
+        if mapping is None:
+            return result("table_merge_grid_mismatch", source_sha256, query, [])
+        entries.append([(ordinal, *entry) for ordinal, entry in enumerate(mapping, start=1)])
+    if query["start_row"] == query["end_row"] and query["start_col"] == query["end_col"]:
+        return result("table_merge_geometry_unsupported", source_sha256, query, [])
+    for column in range(query["start_col"], query["end_col"] + 1):
+        try:
+            width = int(grid_cols[column - 1].get(Q(namespace, "w")) or "")
+        except ValueError:
+            width = 0
+        if width <= 0:
+            return result("table_merge_grid_mismatch", source_sha256, query, [])
+
+    origin, blocked = _merge_rectangle_conflict(
+        entries,
+        namespace,
+        start_row=query["start_row"],
+        end_row=query["end_row"],
+        start_col=query["start_col"],
+        end_col=query["end_col"],
+    )
+    if blocked is not None:
+        code, reason, r_idx, (ordinal, _, c_start, c_end) = blocked
+        conflict = {
+            "reason": reason,
+            "row": r_idx,
+            "cell": ordinal,
+            "cell_start_col": c_start,
+            "cell_end_col": c_end,
+        }
+        return result(code, source_sha256, query, [], conflict)
+    if origin is None:
+        return result("table_merge_geometry_unsupported", source_sha256, query, [])
+    fingerprint = table_merge_structure_fingerprint(
+        path, **{k: query[k] for k in _COORDINATES}, part=part
+    )
+    if fingerprint is None:
+        return result("table_merge_structure_unsupported", source_sha256, query, [])
+    candidate = TableMergeTarget(
+        **{k: query[k] for k in _COORDINATES},
+        structure_fingerprint_sha256=fingerprint,
+        action="merge",
+        part=part,
+        origin_text=_get_cell_text(origin, namespace),
+        is_merged=False,
+    )
+    return result(None, source_sha256, query, [candidate.to_dict()])
+
+
 _MERGE_OWNED_TCPR = frozenset({"tcW", "gridSpan", "vMerge"})
 _FAILED_VERIFICATION = "table_merge_staged_verification_failed"
 
@@ -1168,6 +1291,98 @@ def _entry_at(
         if entry[2] <= column <= entry[3]:
             return entry
     return None
+
+
+_MergeConflict = tuple[str, str, int, tuple[int, ET.Element, int, int]]
+
+
+def _merge_rectangle_conflict(
+    entries: list[list[tuple[int, ET.Element, int, int]]],
+    namespace: str,
+    *,
+    start_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+) -> tuple[ET.Element | None, _MergeConflict | None]:
+    """Check a rectangle of unmerged cells for a lossless merge.
+
+    Returns ``(origin_cell, None)`` when admitted, ``(None, (code, reason, row, entry))`` for
+    the first blocking cell, or ``(None, None)`` when no cell starts at the origin.
+    """
+    word = lambda local: Q(namespace, local)
+    origin: ET.Element | None = None
+    for r_idx in range(start_row, end_row + 1):
+        for entry in entries[r_idx - 1]:
+            _, cell, c_start, c_end = entry
+            if c_end < start_col or c_start > end_col:
+                continue
+            if c_start < start_col or c_end > end_col:
+                return None, (
+                    "table_merge_geometry_unsupported",
+                    "cell_crosses_target_boundary",
+                    r_idx,
+                    entry,
+                )
+            if cell.find(f".//{word('tbl')}") is not None:
+                return None, (
+                    "table_merge_geometry_unsupported",
+                    "cell_contains_nested_table",
+                    r_idx,
+                    entry,
+                )
+            if _has_forbidden_cell_descendant(cell):
+                return None, (
+                    "table_merge_geometry_unsupported",
+                    "cell_contains_unsupported_content",
+                    r_idx,
+                    entry,
+                )
+            try:
+                span, v_merge = _cell_merge_state(cell, namespace)
+            except ValueError:
+                return None, (
+                    "table_merge_structure_unsupported",
+                    "malformed_merge_markup",
+                    r_idx,
+                    entry,
+                )
+            if span > 1 or v_merge is not None:
+                return None, (
+                    "table_merge_geometry_unsupported",
+                    "cell_already_merged",
+                    r_idx,
+                    entry,
+                )
+            if r_idx == start_row and c_start == start_col:
+                origin = cell
+            elif _cell_has_user_content(cell, namespace):
+                return None, (
+                    "table_merge_content_loss_unsupported",
+                    "cell_has_content",
+                    r_idx,
+                    entry,
+                )
+
+    if origin is None:
+        return None, None
+
+    # A continue cell directly below would silently join the new vertical merge.
+    if end_row > start_row and end_row < len(entries):
+        below = _entry_at(entries[end_row], start_col)
+        if below is not None and below[2] == start_col:
+            try:
+                _, below_vmerge = _cell_merge_state(below[1], namespace)
+            except ValueError:
+                below_vmerge = None
+            if below_vmerge == "continue":
+                return None, (
+                    "table_merge_geometry_unsupported",
+                    "vmerge_continues_below_target",
+                    end_row + 1,
+                    below,
+                )
+    return origin, None
 
 
 def _signature_outside_table(root: ET.Element, table: ET.Element) -> bytes | None:
@@ -1251,8 +1466,7 @@ def author_table_merge(request: TableMergeRequest) -> TableMergeReport:
     if namespace is None:
         return _table_merge_refusal(request, "table_merge_namespace_unsupported")
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     unsupported_context = _unsupported_context_by_element(root, namespace)
     tables = list(root.iter(word("tbl")))
     if request.table < 1 or request.table > len(tables):
@@ -1374,72 +1588,20 @@ def author_table_merge(request: TableMergeRequest) -> TableMergeReport:
     continuation_texts: dict[int, str] = {}
 
     if request.action == "merge":
-        # MERGE VALIDATION
-        for r_idx in range(request.start_row, request.end_row + 1):
-            for entry in entries[r_idx - 1]:
-                _, cell, c_start, c_end = entry
-                if c_end < request.start_col or c_start > request.end_col:
-                    continue
-                if c_start < request.start_col or c_end > request.end_col:
-                    return cell_refusal(
-                        "table_merge_geometry_unsupported",
-                        "cell_crosses_target_boundary",
-                        r_idx,
-                        entry,
-                    )
-                if cell.find(f".//{word('tbl')}") is not None:
-                    return cell_refusal(
-                        "table_merge_geometry_unsupported",
-                        "cell_contains_nested_table",
-                        r_idx,
-                        entry,
-                    )
-                if _has_forbidden_cell_descendant(cell):
-                    return cell_refusal(
-                        "table_merge_geometry_unsupported",
-                        "cell_contains_unsupported_content",
-                        r_idx,
-                        entry,
-                    )
-                try:
-                    span, v_merge = _cell_merge_state(cell, namespace)
-                except ValueError:
-                    return cell_refusal(
-                        "table_merge_structure_unsupported",
-                        "malformed_merge_markup",
-                        r_idx,
-                        entry,
-                    )
-                if span > 1 or v_merge is not None:
-                    return cell_refusal(
-                        "table_merge_geometry_unsupported", "cell_already_merged", r_idx, entry
-                    )
-                if r_idx == request.start_row and c_start == request.start_col:
-                    origin_cell = cell
-                    origin_text = _get_cell_text(cell, namespace)
-                elif _cell_has_user_content(cell, namespace):
-                    return cell_refusal(
-                        "table_merge_content_loss_unsupported", "cell_has_content", r_idx, entry
-                    )
-
+        # MERGE VALIDATION (shared with the explicit-rectangle discovery query)
+        origin_cell, blocked = _merge_rectangle_conflict(
+            entries,
+            namespace,
+            start_row=request.start_row,
+            end_row=request.end_row,
+            start_col=request.start_col,
+            end_col=request.end_col,
+        )
+        if blocked is not None:
+            return cell_refusal(*blocked)
         if origin_cell is None:
             return _table_merge_refusal(request, "table_merge_geometry_unsupported")
-
-        # A continue cell directly below would silently join the new vertical merge.
-        if row_span > 1 and request.end_row < len(rows):
-            below = _entry_at(entries[request.end_row], request.start_col)
-            if below is not None and below[2] == request.start_col:
-                try:
-                    _, below_vmerge = _cell_merge_state(below[1], namespace)
-                except ValueError:
-                    below_vmerge = None
-                if below_vmerge == "continue":
-                    return cell_refusal(
-                        "table_merge_geometry_unsupported",
-                        "vmerge_continues_below_target",
-                        request.end_row + 1,
-                        below,
-                    )
+        origin_text = _get_cell_text(origin_cell, namespace)
 
         # EXECUTE MERGE
         origin_tc_pr = origin_cell.find(word("tcPr"))

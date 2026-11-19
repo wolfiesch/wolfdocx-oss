@@ -28,6 +28,7 @@ from .inspect import (
 )
 from .package import PackageError, PackageGraph
 from .review import _DOCUMENT, ReviewReport, _publish
+from .style_resolution import NativeLayoutError, _Styles
 from .table_properties import _VALID_ALIGNMENTS, _canonical_table_alignment
 
 __all__ = [
@@ -143,8 +144,7 @@ def _unrelated_parts_preserved(source: Path, candidate: Path, changed: frozenset
 
 def _is_supported_table(table: ET.Element, namespace: str) -> bool:
     """True if table has supported body table structure and at least one row."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     if any(child.tag not in {word("tblPr"), word("tblGrid"), word("tr")} for child in table):
         return False
     rows = table.findall(word("tr"))
@@ -154,8 +154,7 @@ def _is_supported_table(table: ET.Element, namespace: str) -> bool:
 def _insert_or_replace_trpr_child(tr_pr: ET.Element, new_child: ET.Element, namespace: str) -> None:
     """Insert or replace a child element in trPr while strictly maintaining schema order."""
     local_name = new_child.tag.rsplit("}", 1)[-1]
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     for existing in list(tr_pr.findall(word(local_name))):
         tr_pr.remove(existing)
     try:
@@ -402,6 +401,7 @@ class TableRowPropertiesTarget:
     part: str = _DOCUMENT
     cells_count: int = 0
     current_properties: dict[str, Any] | None = None
+    native_table_row_properties_render_supported: bool = True
 
     @property
     def target(self) -> dict[str, Any]:
@@ -415,6 +415,7 @@ class TableRowPropertiesTarget:
             "cells_count": self.cells_count,
             "structure_fingerprint_sha256": self.structure_fingerprint_sha256,
             "current_properties": self.current_properties,
+            "native_table_row_properties_render_supported": self.native_table_row_properties_render_supported,
         }
 
 
@@ -495,6 +496,7 @@ class TableRowPropertiesReport:
     destination_sha256: str | None = None
     target: dict[str, Any] | None = None
     properties: dict[str, Any] | None = None
+    native_table_row_properties_render_supported: bool | None = None
     target_change_report: dict[str, Any] | None = None
     non_target_parts_preserved: bool | None = None
 
@@ -513,6 +515,7 @@ class TableRowPropertiesReport:
             "destination_sha256": self.destination_sha256,
             "target": self.target,
             "properties": self.properties,
+            "native_table_row_properties_render_supported": self.native_table_row_properties_render_supported,
             "target_change_report": self.target_change_report,
             "non_target_parts_preserved": self.non_target_parts_preserved,
         }
@@ -530,6 +533,7 @@ def _table_row_properties_refusal(
         destination_sha256=None,
         target=target if target is not None else request.target_dict(),
         properties=request.properties_dict(),
+        native_table_row_properties_render_supported=None,
         target_change_report=None,
         non_target_parts_preserved=None,
     )
@@ -603,8 +607,7 @@ def table_row_properties_structure_fingerprint(
         ns = _word_namespace(root)
         if ns is None:
             return None
-        def word(local):
-            return Q(ns, local)
+        word = lambda local: Q(ns, local)
         tables = list(root.iter(word("tbl")))
         if table < 1 or table > len(tables):
             return None
@@ -630,8 +633,7 @@ def _inspect_row_properties(tr_pr: ET.Element | None, namespace: str) -> dict[st
     """Inspect and extract current row properties from w:trPr."""
     if tr_pr is None:
         return {}
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     result: dict[str, Any] = {}
 
     def on_off(element: ET.Element) -> bool:
@@ -692,8 +694,7 @@ def _row_covers_grid(
     table: ET.Element, row: ET.Element, tr_pr: ET.Element | None, namespace: str
 ) -> bool:
     """True when gridBefore, the cell spans and gridAfter exactly fill the table grid."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     grid = table.find(word("tblGrid"))
     columns = 0 if grid is None else len(grid.findall(word("gridCol")))
 
@@ -711,8 +712,7 @@ def _row_covers_grid(
 
 def _row_property_element(key: str, value: Any, namespace: str) -> ET.Element:
     """The trPr child expressing one validated, non-``None`` request value."""
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     element = ET.Element(word(_PROPERTY_ELEMENTS[key]))
     if key in _FLAG_PROPERTY_ELEMENTS:
         if value is False:
@@ -738,6 +738,90 @@ def _apply_row_properties(tr_pr: ET.Element, properties: Mapping[str, Any], name
             _insert_or_replace_trpr_child(
                 tr_pr, _row_property_element(key, value, namespace), namespace
             )
+
+
+def _native_row_render_supported(
+    table: ET.Element,
+    row: ET.Element,
+    graph: PackageGraph,
+    namespace: str,
+) -> bool:
+    """Determine whether native layout engine natively supports this row's properties."""
+    word = lambda local: Q(namespace, local)
+
+    # 1. Row-level table property exceptions
+    if row.find(word("tblPrEx")) is not None:
+        return False
+
+    # 2. Row shifting via gridBefore / gridAfter
+    tr_pr = row.find(word("trPr"))
+    if tr_pr is not None and (
+        tr_pr.find(word("gridBefore")) is not None or tr_pr.find(word("gridAfter")) is not None
+    ):
+        return False
+
+    # 3. Cells in row: textDirection or unsupported cell children
+    for cell in row.findall(word("tc")):
+        tc_pr = cell.find(word("tcPr"))
+        if tc_pr is not None and tc_pr.find(word("textDirection")) is not None:
+            return False
+        for child in cell:
+            tag_local = child.tag.rsplit("}", 1)[-1]
+            if tag_local == "tbl" or (tag_local != "p" and tag_local != "tcPr"):
+                return False
+
+    # 4. Table grid checks
+    tbl_grid = table.find(word("tblGrid"))
+    if tbl_grid is None:
+        return False
+    grid_cols = tbl_grid.findall(word("gridCol"))
+    if not grid_cols:
+        return False
+    for col in grid_cols:
+        w_attr = col.get(word("w"))
+        if w_attr is None:
+            return False
+        try:
+            if int(w_attr) <= 0:
+                return False
+        except ValueError:
+            return False
+
+    # 5. Direct conditional formatting on table
+    if table.find(word("tblStylePr")) is not None:
+        return False
+
+    # 6. Style resolution
+    try:
+        styles = _Styles(graph)
+        tbl_pr = table.find(word("tblPr"))
+        properties = styles.table_properties(tbl_pr)
+        style_id = properties.get("tstyle")
+        if isinstance(style_id, str) and style_id:
+            merged = dict(styles.table_style(style_id))
+            merged.update(properties)
+            properties = merged
+        if properties.get("conditional_formatting"):
+            return False
+        declared = properties.get("width")
+        if isinstance(declared, tuple) and len(declared) == 2:
+            kind, raw_width = declared
+            if kind in {"dxa", "pct"}:
+                if not (isinstance(raw_width, (int, float)) and raw_width > 0):
+                    return False
+            elif kind not in {"auto", "nil"}:
+                return False
+    except (
+        NativeLayoutError,
+        PackageError,
+        ET.ParseError,
+        KeyError,
+        OSError,
+        ValueError,
+    ):
+        return False
+
+    return True
 
 
 def discover_table_row_properties_targets(
@@ -827,8 +911,7 @@ def discover_table_row_properties_targets(
             "targets": [],
         }
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     unsupported_context = _unsupported_context_by_element(root, namespace)
     tables = list(root.iter(word("tbl")))
     targets: list[dict[str, Any]] = []
@@ -864,6 +947,7 @@ def discover_table_row_properties_targets(
 
             fp = _row_structure_fingerprint(row)
             current_props = _inspect_row_properties(tr_pr, namespace)
+            native_supported = _native_row_render_supported(table, row, graph, namespace)
 
             target = TableRowPropertiesTarget(
                 table=table_idx,
@@ -872,6 +956,7 @@ def discover_table_row_properties_targets(
                 part=part,
                 cells_count=len(cells),
                 current_properties=current_props,
+                native_table_row_properties_render_supported=native_supported,
             )
             targets.append(target.to_dict())
 
@@ -935,8 +1020,7 @@ def author_table_row_properties(
     if namespace is None:
         return _table_row_properties_refusal(request, "table_row_properties_namespace_unsupported")
 
-    def word(local):
-        return Q(namespace, local)
+    word = lambda local: Q(namespace, local)
     tables = list(root.iter(word("tbl")))
     if request.table < 1 or request.table > len(tables):
         return _table_row_properties_refusal(request, "table_row_properties_target_missing")
@@ -1007,6 +1091,7 @@ def author_table_row_properties(
         target_row.remove(tr_pr)
         tr_pr = None
 
+    native_supported = _native_row_render_supported(target_table, target_row, graph, namespace)
     properties_after = _inspect_row_properties(tr_pr, namespace)
 
     cells = target_row.findall(word("tc"))
@@ -1090,6 +1175,7 @@ def author_table_row_properties(
         destination_sha256=published.output_sha256,
         target=request.target_dict(),
         properties=props,
+        native_table_row_properties_render_supported=native_supported,
         target_change_report=target_change_report,
         non_target_parts_preserved=True,
     )

@@ -308,14 +308,16 @@ class ReviewRequest:
 
 @dataclass(frozen=True)
 class ReviewDecisionRequest:
-    """One accept or reject decision over named revisions or one author's revisions.
+    """One accept or reject decision over named, one author's, or all revisions.
 
-    Name revisions exactly through ``revisions``, or leave it empty and set
+    Name revisions exactly through ``revisions``; or leave it empty and set
     ``author_filter`` to decide every discoverable revision attributed to that
-    author across the body, referenced headers and footers, and note parts. An
-    author-scoped decision is all-or-nothing: it refuses without writing unless
-    every revision markup element the package attributes to that author is
-    decidable, and publishes only after the staged package holds none of them.
+    author, or ``all_revisions`` to decide every discoverable revision, across the
+    body, referenced headers and footers, and note parts. A scoped decision is
+    all-or-nothing: it refuses without writing unless every revision markup
+    element in its scope (any Word element carrying ``w:author`` other than a
+    comment) is decidable, and publishes only after the staged package holds
+    none of them.
     """
 
     source: Path
@@ -324,6 +326,7 @@ class ReviewDecisionRequest:
     action: str
     revisions: tuple[ReviewRevisionRef, ...] = ()
     author_filter: str | None = None
+    all_revisions: bool = False
 
 
 @dataclass(frozen=True)
@@ -426,20 +429,23 @@ def parse_review_request(value: Any) -> ReviewRequest:
 
 def parse_review_decision_request(value: Any) -> ReviewDecisionRequest:
     required = {"source", "source_sha256", "output", "action"}
+    selectors = {"revisions", "author_filter", "all_revisions"}
     if (
         not isinstance(value, Mapping)
         or not required <= set(value)
-        or not set(value) <= required | {"revisions", "author_filter"}
-        or not set(value) & {"revisions", "author_filter"}
+        or not set(value) <= required | selectors
+        or not set(value) & selectors
     ):
         raise ValueError("review_decision_request_invalid")
     listed = value.get("revisions", [])
+    all_revisions = value.get("all_revisions", False)
     if (
         not isinstance(value["source"], str)
         or not isinstance(value["output"], str)
         or value["action"] not in {"accept", "reject"}
         or not isinstance(listed, list)
-        or (not listed and "author_filter" not in value)
+        or type(all_revisions) is not bool
+        or (not listed and "author_filter" not in value and not all_revisions)
     ):
         raise ValueError("review_decision_fields_invalid")
     author_filter = (
@@ -447,7 +453,7 @@ def parse_review_decision_request(value: Any) -> ReviewDecisionRequest:
         if "author_filter" in value
         else None
     )
-    if author_filter is not None and listed:
+    if sum((bool(listed), author_filter is not None, all_revisions)) > 1:
         raise ValueError("review_decision_selection_ambiguous")
     revisions = tuple(_parse_revision_ref(item) for item in listed)
     if len({(item.part, item.revision_id) for item in revisions}) != len(revisions):
@@ -459,6 +465,7 @@ def parse_review_decision_request(value: Any) -> ReviewDecisionRequest:
         value["action"],
         revisions,
         author_filter,
+        all_revisions,
     )
 
 
@@ -520,7 +527,7 @@ def _note_part(graph: PackageGraph, kind: str) -> tuple[str, str] | None:
     if package_part is None or package_part.content_type != content_type:
         return None
     try:
-        root = ET.fromstring(graph.read_part_bytes(target))
+        root = parse_xml_with_preserved_qnames(graph.read_part_bytes(target))
     except (ET.ParseError, PackageError):
         return None
     namespace = _word_namespace(root)
@@ -638,7 +645,7 @@ def discover_review_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
     except (OSError, PackageError):
         return {"passed": False, "code": "review_source_package_invalid", "targets": []}
     try:
-        document_root = ET.fromstring(parts[_DOCUMENT])
+        document_root = parse_xml_with_preserved_qnames(parts[_DOCUMENT])
     except (KeyError, ET.ParseError):
         return {"passed": False, "code": "review_source_package_invalid", "targets": []}
     namespace = _word_namespace(document_root)
@@ -654,7 +661,7 @@ def discover_review_targets(source: str | Path, *, part: str = _DOCUMENT) -> dic
             "targets": [],
         }
     try:
-        root = ET.fromstring(parts[part])
+        root = parse_xml_with_preserved_qnames(parts[part])
     except (KeyError, ET.ParseError):
         return {"passed": False, "code": "review_source_package_invalid", "targets": []}
     part_namespace = _word_namespace(root)
@@ -1408,7 +1415,7 @@ def _unsupported_part_records(
             continue
         region = allowed[name].region if name in allowed else None
         try:
-            part_root = ET.fromstring(parts[name])
+            part_root = parse_xml_with_preserved_qnames(parts[name])
         except ET.ParseError:
             unsupported.append(
                 {
@@ -1526,7 +1533,7 @@ def discover_review_revisions(source: str | Path, *, part: str = _DOCUMENT) -> d
     except (OSError, PackageError):
         return _revision_discovery_refusal(source_sha256, "review_source_package_invalid")
     try:
-        document_root = ET.fromstring(parts[_DOCUMENT])
+        document_root = parse_xml_with_preserved_qnames(parts[_DOCUMENT])
     except (KeyError, ET.ParseError):
         return _revision_discovery_refusal(source_sha256, "review_source_package_invalid")
     namespace = _word_namespace(document_root)
@@ -1538,7 +1545,7 @@ def discover_review_revisions(source: str | Path, *, part: str = _DOCUMENT) -> d
             source_sha256, "review_part_unsupported", part=part, parts=allowed
         )
     try:
-        root = ET.fromstring(parts[part])
+        root = parse_xml_with_preserved_qnames(parts[part])
     except (KeyError, ET.ParseError):
         return _revision_discovery_refusal(source_sha256, "review_source_package_invalid")
     part_namespace = _word_namespace(root)
@@ -1574,7 +1581,7 @@ def _revision_settings(graph: PackageGraph, parts: Mapping[str, bytes]) -> dict[
     if len(relationships) != 1 or relationships[0].resolved_target() not in parts:
         return {"track_revisions": None, "revision_view": None}
     try:
-        root = ET.fromstring(parts[relationships[0].resolved_target()])
+        root = parse_xml_with_preserved_qnames(parts[relationships[0].resolved_target()])
     except ET.ParseError:
         return {"track_revisions": None, "revision_view": None}
     namespace = _word_namespace(root)
@@ -2103,7 +2110,7 @@ def _all_revision_ids(parts: Mapping[str, bytes]) -> set[int]:
         if not name.startswith("word/") or not name.endswith(".xml"):
             continue
         try:
-            root = ET.fromstring(data)
+            root = parse_xml_with_preserved_qnames(data)
         except ET.ParseError:
             continue
         for node in root.iter():
@@ -2420,7 +2427,7 @@ def author_review(request: ReviewRequest) -> ReviewReport:
     try:
         graph = PackageGraph.from_file(source)
         parts = {name: graph.read_part_bytes(name) for name in graph.parts}
-        document_root = ET.fromstring(parts[_DOCUMENT])
+        document_root = parse_xml_with_preserved_qnames(parts[_DOCUMENT])
         if _word_namespace(document_root) is None:
             return _refusal(request.source_sha256, "review_namespace_unsupported")
         allowed = _review_parts(graph, document_root, _word_namespace(document_root) or "")
@@ -2515,12 +2522,13 @@ def author_review(request: ReviewRequest) -> ReviewReport:
         return _refusal(request.source_sha256, "review_package_invalid")
 
 
-def _author_markup(root: ET.Element, author: str) -> list[ET.Element]:
+def _author_markup(root: ET.Element, author: str | None) -> list[ET.Element]:
     """Every revision markup element one part attributes to ``author``.
 
     Any Word-namespace element carrying that ``w:author`` counts, so revision
     kinds this module cannot decide are found too; comments carry an author but
-    are not revisions.
+    are not revisions. ``None`` matches every author, which is the whole
+    revision scope of an ``all_revisions`` decision.
     """
 
     word_namespace = _word_namespace(root) or _W
@@ -2534,14 +2542,15 @@ def _author_markup(root: ET.Element, author: str) -> list[ET.Element]:
                 continue
         else:
             continue
-        if node.get(Q(attribute_namespace, "author")) == author:
+        attributed = node.get(Q(attribute_namespace, "author"))
+        if attributed is not None and (author is None or attributed == author):
             found.append(node)
     return found
 
 
 def _author_markup_uncovered(
     parts: Mapping[str, bytes],
-    author: str,
+    author: str | None,
     roots: Mapping[str, ET.Element],
     covered: frozenset[int],
 ) -> bool:
@@ -2555,7 +2564,7 @@ def _author_markup_uncovered(
     for name in sorted(parts):
         if not name.startswith("word/") or not name.endswith(".xml"):
             continue
-        root = roots[name] if name in roots else ET.fromstring(parts[name])
+        root = roots[name] if name in roots else parse_xml_with_preserved_qnames(parts[name])
         if any(id(node) not in covered for node in _author_markup(root, author)):
             return True
     return False
@@ -2578,7 +2587,7 @@ def _indexed_revision_nodes(entry: _IndexedRevision) -> tuple[ET.Element, ...]:
 
 
 def _author_selection(
-    author: str,
+    author: str | None,
     parts: Mapping[str, bytes],
     allowed: Mapping[str, _ReviewPart],
     roots: dict[str, ET.Element],
@@ -2594,6 +2603,8 @@ def _author_selection(
     (unsupported kinds, unpaired moves, revisions outside reviewable parts)
     refuses with ``review_revision_author_scope_unsupported``. Only parts with a
     match are recorded in ``roots``, so untouched parts are never reserialized.
+    ``author=None`` selects every author's revisions and reports its refusals as
+    ``review_revision_all_unmatched`` and ``review_revision_all_scope_unsupported``.
     """
 
     selected: list[tuple[str, _IndexedRevision]] = []
@@ -2607,7 +2618,7 @@ def _author_selection(
             return "review_package_invalid"
         root, namespace = loaded
         ordered, _, duplicates = _part_revision_index(root, namespace)
-        matched = [entry for entry in ordered if entry.author == author]
+        matched = [entry for entry in ordered if author is None or entry.author == author]
         if not matched:
             continue
         parents = {id(child): parent for parent in root.iter() for child in parent}
@@ -2630,22 +2641,27 @@ def _author_selection(
             )
             covered.update(id(node) for node in _indexed_revision_nodes(entry))
         roots[name], namespaces[name], parents_by_part[name] = root, namespace, parents
+    scope = "all" if author is None else "author"
     if not selected:
-        return "review_revision_author_unmatched"
+        return f"review_revision_{scope}_unmatched"
     if _author_markup_uncovered(parts, author, scanned, frozenset(covered)):
-        return "review_revision_author_scope_unsupported"
+        return f"review_revision_{scope}_scope_unsupported"
     return selected, tuple(references)
 
 
-def _author_residual_verifier(author: str) -> Callable[[Path], str | None]:
-    """Staged-package check: no markup attributed to ``author`` survives the decision."""
+def _author_residual_verifier(author: str | None) -> Callable[[Path], str | None]:
+    """Staged-package check: no markup attributed to ``author`` (any, for ``None``) survives."""
+
+    residual = (
+        "review_revision_all_residual" if author is None else "review_revision_author_residual"
+    )
 
     def verify(staged: Path) -> str | None:
         try:
             graph = PackageGraph.from_file(staged)
             parts = {name: graph.read_part_bytes(name) for name in graph.parts}
             if _author_markup_uncovered(parts, author, {}, frozenset()):
-                return "review_revision_author_residual"
+                return residual
         except (OSError, PackageError, ET.ParseError):
             return "review_staged_verification_failed"
         return None
@@ -2659,7 +2675,10 @@ def decide_review(request: ReviewDecisionRequest) -> ReviewReport:
         return _refusal(request.source_sha256, "review_destination_invalid")
     if _sha256(source) != request.source_sha256:
         return _refusal(request.source_sha256, "review_source_hash_mismatch")
-    if request.author_filter is None:
+    if request.all_revisions:
+        if request.revisions or request.author_filter is not None:
+            return _refusal(request.source_sha256, "review_decision_selection_ambiguous")
+    elif request.author_filter is None:
         if not request.revisions:
             return _refusal(request.source_sha256, "review_decision_selection_empty")
     elif request.revisions:
@@ -2673,7 +2692,7 @@ def decide_review(request: ReviewDecisionRequest) -> ReviewReport:
     try:
         graph = PackageGraph.from_file(source)
         parts = {name: graph.read_part_bytes(name) for name in graph.parts}
-        document_root = ET.fromstring(parts[_DOCUMENT])
+        document_root = parse_xml_with_preserved_qnames(parts[_DOCUMENT])
         document_namespace = _word_namespace(document_root)
         if document_namespace is None:
             return _refusal(request.source_sha256, "review_namespace_unsupported")
@@ -2686,7 +2705,7 @@ def decide_review(request: ReviewDecisionRequest) -> ReviewReport:
         positions_by_part: dict[str, dict[int, int]] = {}
         references = request.revisions
         verify: Callable[[Path], str | None] | None = None
-        if request.author_filter is not None:
+        if request.author_filter is not None or request.all_revisions:
             chosen = _author_selection(
                 request.author_filter,
                 parts,

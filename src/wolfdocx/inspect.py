@@ -4,16 +4,26 @@
 fingerprint text inventories. Its documented English-only readability heuristic does
 not require layout, fonts, or a pronunciation dictionary.
 
+Signature-line attribute diagnostics cover VML and DrawingML story markup using
+the same lexical validation as ``inspect_signature_lines``.
 OPC part-name and relationships-part admission share the PackageGraph validators;
 inspection retains its bounded parsing, per-part diagnostics, and reuse behavior.
 Content-type coverage/uniqueness and relationship references in every retained MCE
 branch are diagnosed without changing package bytes.
+Orphan custom XML bindings are warnings: cached SDT content remains readable and
+editable even when its storeItemID has no matching datastore item.
 """
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import posixpath
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import unicodedata
 import zipfile
@@ -27,6 +37,7 @@ from typing import TYPE_CHECKING, Any, cast
 from xml.etree import ElementTree as ET
 
 from . import _inspection_cache
+from ._optional import feature_module
 from .canonical import (
     semantic_json_bytes,
     semantic_sha256,
@@ -795,6 +806,39 @@ def _relationship_kind(value: str | None) -> str:
     if re.fullmatch(r"[a-z0-9._-]{1,64}", candidate):
         return candidate
     return "other"
+
+
+def _custom_xml_binding_issues(parsed_xml: Mapping[str, ET.Element]) -> list[Issue]:
+    """Diagnose absent datastore identities without evaluating binding XPath."""
+    stores: set[str] = set()
+    for root in parsed_xml.values():
+        namespace = _element_namespace(root)
+        if namespace not in {
+            "http://schemas.openxmlformats.org/officeDocument/2006/customXml",
+            "http://purl.oclc.org/ooxml/officeDocument/customXml",
+        } or root.tag != Q(namespace, "datastoreItem"):
+            continue
+        item_id = root.get(Q(namespace, "itemID"))
+        if item_id:
+            stores.add(item_id.strip("{}").casefold())
+    issues: list[Issue] = []
+    for part_name, root in parsed_xml.items():
+        namespace = _element_namespace(root)
+        if namespace not in SUPPORTED_WORD_NAMESPACES:
+            continue
+        for binding in root.iter(Q(namespace, "dataBinding")):
+            item_id = binding.get(Q(namespace, "storeItemID"))
+            if item_id and item_id.strip("{}").casefold() in stores:
+                continue
+            issues.append(
+                Issue(
+                    "orphan_custom_xml_binding",
+                    "warning",
+                    f"Custom XML binding storeItemID {item_id or '<missing>'} has no datastore item.",
+                    part_name,
+                )
+            )
+    return issues
 
 
 def _note_reference_issues(tree: Callable[[str], ET.Element | None]) -> list[Issue]:
@@ -2126,7 +2170,7 @@ def _remembered_inspection(
 
 
 def _clear_inspection_memo() -> None:
-    """Forget every memoized inspection."""
+    """Forget every memoized inspection (benchmarks measure cold requests with this)."""
     with _inspection_memo_lock:
         _inspection_memo.clear()
 
@@ -2665,6 +2709,9 @@ def _inspect_package_bytes(
     reference_facts = (
         store.facts(limits.to_dict(), "relationship-reference-check") if store is not None else None
     )
+    binding_facts = (
+        store.facts(limits.to_dict(), "custom-xml-binding-check") if store is not None else None
+    )
     new_facts: dict[bytes, int] = {}
     element_counts: dict[str, int] = {}
     part_sha256: dict[str, str] = {}
@@ -2933,19 +2980,23 @@ def _inspect_package_bytes(
                         )
 
             # Reuse only a passing check for the exact part inventory and bytes. Names
-            # matter because relationship IDs belong to the source part's .rels file.
-            reference_key = (
-                reference_facts.key(
-                    "\0\0".join(f"{name}\0{part_sha256[name]}" for name in sorted(part_sha256))
-                )
-                if reference_facts is not None
-                else None
+            # matter because relationship IDs belong to the source part's .rels file,
+            # and a binding's datastore item may live in any part.
+            inventory = (
+                "\0\0".join(f"{name}\0{part_sha256[name]}" for name in sorted(part_sha256))
+                if store is not None
+                else ""
             )
-            if reference_key is None or reference_facts.lookup(reference_key) != 0:
-                reference_issues = _relationship_reference_issues(_PartTrees(parsed_xml))
-                report.issues.extend(reference_issues)
-                if reference_key is not None and not reference_issues:
-                    new_facts[reference_key] = 0
+            for check_facts, check in (
+                (reference_facts, _relationship_reference_issues),
+                (binding_facts, _custom_xml_binding_issues),
+            ):
+                check_key = check_facts.key(inventory) if check_facts is not None else None
+                if check_key is None or check_facts.lookup(check_key) != 0:
+                    check_issues = check(_PartTrees(parsed_xml))
+                    report.issues.extend(check_issues)
+                    if check_key is not None and not check_issues:
+                        new_facts[check_key] = 0
 
             # An entry refused by a size or ratio limit has no recorded part, so the part
             # inventory is incomplete and the macro check cannot trust its absences.
@@ -2976,6 +3027,32 @@ def _inspect_package_bytes(
                 report.issues.extend(note_issues)
                 if note_key is not None and not note_issues:
                     new_facts[note_key] = 0
+            signature_line_tags = {
+                Q("urn:schemas-microsoft-com:office:office", "signatureline"),
+                Q("http://schemas.microsoft.com/office/drawing/2012/main", "signatureLine"),
+            }
+            for part_name, root in parsed_xml.items():
+                # A deferred part comes from a valid package, so it has no diagnostics.
+                if type(root) is _DeferredXml:
+                    continue
+                for element in root.iter():
+                    if element.tag not in signature_line_tags:
+                        continue
+                    # Defer the import to avoid the signature_line -> inspect cycle.
+                    _feature_signature_line = feature_module("signature_line")
+                    signature_line_attribute_issues = (
+                        _feature_signature_line.signature_line_attribute_issues
+                    )
+
+                    for issue in signature_line_attribute_issues(element):
+                        report.issues.append(
+                            Issue(
+                                issue["code"],
+                                "error",
+                                f"Invalid signature-line {issue['attribute']}: {issue['value']!r}.",
+                                part_name,
+                            )
+                        )
             for entry in entries:
                 if entry.filename.endswith("/") or entry.filename not in part_sha256:
                     continue
@@ -3122,6 +3199,7 @@ def _inspect_package_graph(
     if content_types_root is not None:
         report.issues.extend(_content_type_issues(content_types_root, set(graph.parts)))
     report.issues.extend(_relationship_reference_issues(parsed_xml))
+    report.issues.extend(_custom_xml_binding_issues(parsed_xml))
     report.fingerprint = _fingerprint(parsed_xml, set(graph.parts))
     report.part_texts = {
         name: _part_text(root) for name, root in parsed_xml.items() if name.startswith("word/")
@@ -3937,16 +4015,100 @@ def _all_stories_counts(
     )
 
 
-
+def _wolf_statistics_layout(path: Path, binary: str, timeout: float | None) -> tuple[int, int]:
+    """Count page/baseline bands of actual main-story lines, including glyphless ones."""
+    with tempfile.TemporaryDirectory(prefix="wolf-statistics-") as scratch:
+        output_dir = Path(scratch)
+        try:
+            process = subprocess.run(
+                [
+                    binary,
+                    "extract",
+                    os.fspath(path.resolve()),
+                    "--what",
+                    "structure",
+                    "--outdir",
+                    os.fspath(output_dir),
+                    "--system-fonts",
+                ],
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(f"statistics_layout_timeout: {error.timeout}") from None
+        try:
+            receipt = json.loads(process.stdout)
+            if not isinstance(receipt, dict):
+                raise TypeError("statistics_layout_receipt_invalid")
+            if process.returncode != 0 or receipt.get("status") != "succeeded":
+                errors = receipt.get("errors", [])
+                detail = "; ".join(
+                    f"{error.get('code')}: {error.get('message')}"
+                    for error in errors
+                    if isinstance(error, dict)
+                )
+                raise ValueError(
+                    f"statistics_layout_incomplete: exit {process.returncode}; {detail}"
+                )
+            outputs = receipt.get("outputs")
+            if not isinstance(outputs, list) or len(outputs) != 1:
+                raise ValueError("statistics_layout_receipt_invalid")
+            output = outputs[0]
+            if not isinstance(output, dict) or output.get("schema") != "wolfdocx.extract.v1":
+                raise ValueError("statistics_layout_schema_invalid")
+            artifact = Path(output["path"])
+            if artifact.resolve().parent != output_dir.resolve():
+                raise ValueError("statistics_layout_receipt_invalid")
+            payload = artifact.read_bytes()
+            if sha256_bytes(payload) != output.get("sha256"):
+                raise ValueError("statistics_layout_output_unverified")
+            structure = json.loads(payload)
+            if not isinstance(structure, dict) or structure.get("schema") != "wolfdocx.extract.v1":
+                raise ValueError("statistics_layout_schema_invalid")
+            geometry = structure.get("line_geometry")
+            pages = structure.get("page_count")
+            if structure.get("paginated") is not True or geometry is None:
+                raise ValueError("statistics_layout_unavailable")
+            if not isinstance(geometry, list) or type(pages) is not int or pages < 1:
+                raise ValueError("statistics_layout_counts_invalid")
+            bands: set[tuple[int, float]] = set()
+            for entry in geometry:
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get("story")
+                    not in {
+                        "body",
+                        "header",
+                        "footer",
+                        "footnote",
+                        "endnote",
+                        "text_box",
+                    }
+                    or type(entry.get("baseline_y")) not in {int, float}
+                    or not math.isfinite(entry["baseline_y"])
+                    or type(entry.get("page")) is not int
+                    or not 1 <= entry["page"] <= pages
+                ):
+                    raise ValueError("statistics_layout_counts_invalid")
+                if entry["story"] == "body":
+                    # XViewCursor.goDown moves vertically, not through simultaneous
+                    # cell lines. Use exact layout baselines, not a fitted distance
+                    # threshold or the renderer's optional painted-glyph grid.
+                    bands.add((entry["page"], entry["baseline_y"]))
+            return len(bands), pages
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError("statistics_layout_receipt_invalid") from error
 
 
 def document_statistics(
     source: str | Path,
     *,
     stories: str = "main",
-    
+    wolf: str | Path | None = None,
+    timeout: float | None = None,
 ) -> DocumentStatistics:
-    """Count text statistics without rendering or laying out the document.
+    """Count text statistics and, when wolf is available, laid-out lines and pages.
 
     ``stories="main"`` counts Word's main story (see :class:`DocumentStatistics`).
     ``stories="all"`` counts the way LibreOffice's document statistics do: the main
@@ -3962,6 +4124,16 @@ def document_statistics(
     is one character. Note marks that restart on every page are numbered per section,
     since the page a mark falls on needs a layout.
 
+    ``wolf`` supplies an executable path; otherwise ``wolf`` is discovered on PATH,
+    the same convention as :func:`wolfdocx.metafile.render_metafile`. Layout uses
+    system and package-embedded fonts. Lines count distinct ``(page, baseline_y)``
+    bands of actual body-story line boxes, including glyphless lines. Table-cell
+    lines on the same baseline of the same page contribute once, matching a vertical
+    LibreOffice view-cursor walk. Baselines are compared exactly, without rounding
+    or a distance threshold. Header, footer, note, and text-box lines are excluded
+    in either mode; words and characters still use the selected story scope. Missing
+    wolf leaves lines/pages as ``None``; a failed, partial, or unavailable layout
+    raises an error rather than inventing a count. ``timeout`` bounds extraction.
 
     The readability fields always measure the main story (see
     :class:`DocumentStatistics`). A missing, unreadable, or unsafe package raises
@@ -3994,6 +4166,19 @@ def document_statistics(
     else:
         words, characters, with_spaces, paragraphs = _count_text(_statistics_paragraphs(body, ns))
     readability = _readability_counts(body, ns)
+    binary = os.fspath(wolf) if wolf is not None else shutil.which("wolf")
+    if binary is None:
+        return DocumentStatistics(
+            words, characters, with_spaces, paragraphs, *readability, stories=stories
+        )
+    lines, pages = _wolf_statistics_layout(path, binary, timeout)
     return DocumentStatistics(
-        words, characters, with_spaces, paragraphs, *readability, stories=stories
+        words,
+        characters,
+        with_spaces,
+        paragraphs,
+        *readability,
+        lines=lines,
+        pages=pages,
+        stories=stories,
     )

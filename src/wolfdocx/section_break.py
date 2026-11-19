@@ -36,6 +36,12 @@ Break type vocabulary (ECMA-376 §17.18.77 ST_SectionMark):
     python-docx ``WD_SECTION`` members and their names in any case (``NEW_COLUMN``,
     ``new_page``). Every accepted spelling is normalized to its ST_SectionMark value
     before authoring, so written markup, requests, and reports carry canonical values.
+
+Native renderer boundary:
+    The WolfDocx native layout renderer (native_layout.py) supports nextPage,
+    continuous, evenPage, and oddPage section breaks. A nextColumn break is authored
+    and verified in the package, but reported with native_section_break_render_supported
+    false.
 """
 
 from __future__ import annotations
@@ -87,6 +93,8 @@ __all__ = [
 ]
 
 _ALLOWED_BREAK_TYPES = frozenset({"nextPage", "nextColumn", "continuous", "evenPage", "oddPage"})
+# Section break types the native layout renderer lays out (see native_layout.py).
+_NATIVE_RENDER_BREAK_TYPES = frozenset({"nextPage", "continuous", "evenPage", "oddPage"})
 # Lowercased python-docx WD_SECTION member names and snake_case ST_SectionMark spellings.
 _BREAK_TYPE_ALIASES: dict[str, str] = {
     "new_page": "nextPage",
@@ -407,6 +415,7 @@ class SectionBreakTarget:
     tag: str = "p"
     text: str = ""
     supported: bool = True
+    native_section_break_render_supported: bool = True
     has_break: bool = False
     can_delete: bool = False
     can_update: bool = False
@@ -432,6 +441,7 @@ class SectionBreakTarget:
             "tag": self.tag,
             "text": self.text,
             "supported": self.supported,
+            "native_section_break_render_supported": self.native_section_break_render_supported,
             "has_break": self.has_break,
             "can_delete": self.can_delete,
             "can_update": self.can_update,
@@ -578,6 +588,7 @@ class SectionBreakReport:
     target_change_report: dict[str, Any] | None = None
     boundaries: dict[str, Any] | None = None
     non_target_parts_preserved: bool | None = None
+    native_section_break_render_supported: bool | None = None
     action: str = "insert"
     link_to_previous: bool | None = None
 
@@ -606,6 +617,10 @@ class SectionBreakReport:
             result["boundaries"] = self.boundaries
         if self.non_target_parts_preserved is not None:
             result["non_target_parts_preserved"] = self.non_target_parts_preserved
+        if self.native_section_break_render_supported is not None:
+            result["native_section_break_render_supported"] = (
+                self.native_section_break_render_supported
+            )
         if self.link_to_previous is not None:
             result["link_to_previous"] = self.link_to_previous
         return result
@@ -625,6 +640,7 @@ def _section_break_refusal(
         target_change_report=None,
         boundaries=None,
         non_target_parts_preserved=None,
+        native_section_break_render_supported=None,
         action=request.action,
         link_to_previous=request.link_to_previous,
     )
@@ -954,6 +970,7 @@ def discover_section_break_targets(
             tag=tag,
             text=text,
             supported=is_supported,
+            native_section_break_render_supported=(b_type in _NATIVE_RENDER_BREAK_TYPES),
             has_break=has_break,
             can_delete=can_delete,
             can_update=can_update,
@@ -1163,6 +1180,9 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
             "deleted_section_index": preceding_sec_index,
             "merged_into_section_index": preceding_sec_index,
             "total_sections": len(sections_after),
+            "native_section_break_render_supported": (
+                succ_break_type in _NATIVE_RENDER_BREAK_TYPES
+            ),
         }
 
         def verify_deletion_publication(staged: Path) -> str | None:
@@ -1258,6 +1278,7 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
             target_change_report=target_change_report,
             boundaries=boundaries,
             non_target_parts_preserved=True,
+            native_section_break_render_supported=(succ_break_type in _NATIVE_RENDER_BREAK_TYPES),
             action="delete",
         )
     if request.action == "update":
@@ -1344,6 +1365,9 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
             "previous_break_type": orig_break_type,
             "break_type": request.break_type,
             "total_sections": len(sections_after),
+            "native_section_break_render_supported": (
+                request.break_type in _NATIVE_RENDER_BREAK_TYPES
+            ),
         }
         if request.link_to_previous is not None:
             target_change_report["link_to_previous"] = request.link_to_previous
@@ -1520,6 +1544,9 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
             target_change_report=target_change_report,
             boundaries=boundaries,
             non_target_parts_preserved=True,
+            native_section_break_render_supported=(
+                request.break_type in _NATIVE_RENDER_BREAK_TYPES
+            ),
             action="update",
             link_to_previous=request.link_to_previous,
         )
@@ -1629,6 +1656,7 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
         "previous_section_index": containing_sec_index,
         "following_section_index": containing_sec_index + 1,
         "total_sections": len(sections_after),
+        "native_section_break_render_supported": (request.break_type in _NATIVE_RENDER_BREAK_TYPES),
     }
     if request.link_to_previous is not None:
         target_change_report["link_to_previous"] = request.link_to_previous
@@ -1806,5 +1834,6 @@ def author_section_break(request: SectionBreakRequest) -> SectionBreakReport:
         target_change_report=target_change_report,
         boundaries=boundaries,
         non_target_parts_preserved=True,
+        native_section_break_render_supported=(request.break_type in _NATIVE_RENDER_BREAK_TYPES),
         link_to_previous=request.link_to_previous,
     )

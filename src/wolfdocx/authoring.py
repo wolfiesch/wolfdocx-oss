@@ -278,8 +278,7 @@ def _word_namespace(root: ET.Element) -> str | None:
 def _selected_cell(
     root: ET.Element, request: CellTextRequest, word_namespace: str
 ) -> ET.Element | None:
-    def word(local):
-        return Q(word_namespace, local)
+    word = lambda local: Q(word_namespace, local)
     tables = list(root.iter(word("tbl")))
     if request.table > len(tables):
         return None
@@ -335,8 +334,7 @@ class _ContextState:
     """Ancestor and sibling-range admission state, consumed in XML start order."""
 
     def __init__(self, word_namespace: str) -> None:
-        def word(local):
-            return Q(word_namespace, local)
+        word = lambda local: Q(word_namespace, local)
         self.context_tags = {word(feature) for feature in _CONTEXT_FEATURES}
         self.range_starts = {
             word("commentRangeStart"): "comment",
@@ -516,8 +514,7 @@ def _simple_text_node(cell: ET.Element, word_namespace: str) -> tuple[ET.Element
     checked against the text node's effective ``xml:space`` before patching.
     """
 
-    def word(local):
-        return Q(word_namespace, local)
+    word = lambda local: Q(word_namespace, local)
     if _has_unsupported_feature(cell, word_namespace):
         return None
     tc_pr = cell.find(word("tcPr"))
@@ -1010,8 +1007,7 @@ def _span_text_nodes(paragraph: ET.Element, word_namespace: str) -> list[_SpanTe
     content in the paragraph is refused rather than crossed or normalized.
     """
 
-    def word(local):
-        return Q(word_namespace, local)
+    word = lambda local: Q(word_namespace, local)
     if _has_unsupported_feature(paragraph, word_namespace):
         return None
     if any(child.tag not in {word("pPr"), word("r")} for child in paragraph):

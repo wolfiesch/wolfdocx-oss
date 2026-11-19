@@ -39,6 +39,7 @@ from wolfdocx.package import (
 from wolfdocx.review import _link_no_clobber
 
 __all__ = [
+    "ALL_STORIES",
     "FindReplaceOptions",
     "FindReplaceReport",
     "FindReplaceRequest",
@@ -51,6 +52,15 @@ _WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 _DOCUMENT = "word/document.xml"
 _SHA256_LENGTH = 64
+
+ALL_STORIES = "*"
+"""The ``part`` value that searches every displayed text story of the document.
+
+One request then covers the main document, each header and footer a section
+references (in reference order), and the footnotes, endnotes and comments parts, and
+``max_replacements`` is spent on the earliest matches in that order.
+"""
+_NOTE_STORY_KINDS = ("footnotes", "endnotes", "comments")
 
 
 class _FindReplaceValidationError(ValueError):
@@ -270,7 +280,7 @@ def load_find_replace_request(path: str | Path) -> FindReplaceRequest:
 # DOM Inspection and Run Text Helpers
 # ---------------------------------------------------------------------------
 
-_TEXT_TAGS = frozenset({"t", "tab", "br", "cr", "noBreakHyphen"})
+_TEXT_TAGS = frozenset({"t", "tab", "br", "cr", "noBreakHyphen", "lastRenderedPageBreak"})
 
 
 def _extract_run_text_segments(run: ET.Element, ns: str) -> list[tuple[str, ET.Element | None]]:
@@ -278,7 +288,9 @@ def _extract_run_text_segments(run: ET.Element, ns: str) -> list[tuple[str, ET.E
 
     ``w:t`` text carries no element; ``w:tab``, ``w:br``, ``w:cr`` and ``w:noBreakHyphen``
     carry their source element so a rebuilt run re-emits them as elements. A page break
-    contributes no searchable text but is still carried, as a zero-width segment.
+    and Word's ``w:lastRenderedPageBreak`` pagination marker contribute no searchable
+    text but are still carried, as zero-width segments, so the text of a run that holds
+    the marker stays searchable.
     """
     segments: list[tuple[str, ET.Element | None]] = []
     t_tag = _q("t", ns)
@@ -286,6 +298,7 @@ def _extract_run_text_segments(run: ET.Element, ns: str) -> list[tuple[str, ET.E
     br_tag = _q("br", ns)
     cr_tag = _q("cr", ns)
     hyphen_tag = _q("noBreakHyphen", ns)
+    rendered_break_tag = _q("lastRenderedPageBreak", ns)
 
     for child in run:
         tag = child.tag
@@ -300,6 +313,8 @@ def _extract_run_text_segments(run: ET.Element, ns: str) -> list[tuple[str, ET.E
             segments.append(("\r", child))
         elif tag == hyphen_tag:
             segments.append(("-", child))
+        elif tag == rendered_break_tag:
+            segments.append(("", child))
     return segments
 
 
@@ -873,35 +888,30 @@ def _process_story_root(
     max_replacements: int | None,
     discovery: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Execute find and replace across all paragraph containers in one story root."""
+    """Execute find and replace across all paragraph containers in one story root.
+
+    ``max_replacements`` is spent on the story's earliest matches in document order,
+    as planned by :func:`_budget_quotas`.
+    """
     containers = _find_paragraph_containers(root, ns)
     p_tag = _q("p", ns)
+    quotas = (
+        None
+        if max_replacements is None
+        else _budget_quotas(root, compiled_pattern, ns, max_replacements)
+    )
 
     total_matches: list[dict[str, Any]] = []
     replacements_done = 0
+    visits = 0
 
     for container in containers:
-        children = list(container)
-        groups: list[list[tuple[int, ET.Element]]] = []
-        current_group: list[tuple[int, ET.Element]] = []
-
-        for idx, child in enumerate(children):
-            if child.tag == p_tag:
-                current_group.append((idx, child))
-            else:
-                if current_group:
-                    groups.append(current_group)
-                    current_group = []
-        if current_group:
-            groups.append(current_group)
-
         # Process groups in reverse order to preserve container slice indices
-        for grp in reversed(groups):
-            rem_budget = (
-                max_replacements - replacements_done if max_replacements is not None else None
-            )
-            if rem_budget is not None and rem_budget <= 0:
-                break
+        for grp in reversed(_paragraph_groups(container, p_tag)):
+            quota = None if quotas is None else quotas[visits] if visits < len(quotas) else 0
+            visits += 1
+            if quota == 0:
+                continue
 
             rebuilt, records, num_done = _process_paragraph_group(
                 grp,
@@ -910,7 +920,7 @@ def _process_story_root(
                 options,
                 ns,
                 part_name,
-                rem_budget,
+                quota,
                 discovery,
             )
             # Splice from the back so earlier child indices stay valid.
@@ -919,7 +929,105 @@ def _process_story_root(
             total_matches.extend(records)
             replacements_done += num_done
 
+    if quotas is not None and (visits != len(quotas) or replacements_done != sum(quotas)):
+        # The edit pass left the planned groups, so the budget could land on later
+        # matches than the first ones; refuse rather than publish that.
+        raise _FindReplaceValidationError("find_replace_budget_unresolved")
     return total_matches, replacements_done
+
+
+def _paragraph_groups(container: ET.Element, p_tag: str) -> list[list[tuple[int, ET.Element]]]:
+    """Split ``container``'s children into runs of consecutive paragraphs."""
+    groups: list[list[tuple[int, ET.Element]]] = []
+    current_group: list[tuple[int, ET.Element]] = []
+    for idx, child in enumerate(container):
+        if child.tag == p_tag:
+            current_group.append((idx, child))
+        elif current_group:
+            groups.append(current_group)
+            current_group = []
+    if current_group:
+        groups.append(current_group)
+    return groups
+
+
+def _budget_quotas(
+    root: ET.Element, compiled_pattern: re.Pattern[str], ns: str, budget: int
+) -> list[int]:
+    """Split ``budget`` over one story's paragraph groups so the first matches win.
+
+    :func:`_process_story_root` visits groups from outer containers to inner ones and,
+    within a container, from the last group to the first, so spending a budget in
+    visit order would replace late matches. This read-only pass ranks every match by
+    the document position of the paragraph it starts in and returns, per visited
+    group, how many of the story's first ``budget`` matches it holds. Inside one group
+    those are always its leading matches, which ``_process_paragraph_group`` keeps.
+    """
+    p_tag = _q("p", ns)
+    position = {id(node): index for index, node in enumerate(root.iter())}
+    ranked: list[tuple[int, int]] = []
+    visits = 0
+    for container in _find_paragraph_containers(root, ns):
+        for group in reversed(_paragraph_groups(container, p_tag)):
+            texts = [
+                "".join(item.text for item in _decompose_paragraph(p, ns)[1]) for _, p in group
+            ]
+            starts: list[int] = []
+            offset = 0
+            for paragraph_text in texts:
+                starts.append(offset)
+                offset += len(paragraph_text) + 1
+            for match in compiled_pattern.finditer("\n".join(texts)):
+                first = bisect.bisect_right(starts, match.start()) - 1
+                ranked.append((position[id(group[first][1])], visits))
+            visits += 1
+    ranked.sort()
+    quotas = [0] * visits
+    for _, visit in ranked[:budget]:
+        quotas[visit] += 1
+    return quotas
+
+
+def _story_parts(graph: PackageGraph, part: str) -> list[str] | None:
+    """Resolve a request ``part`` to the story parts it searches, in budget order.
+
+    A named part searches only itself. :data:`ALL_STORIES` searches the main document,
+    then each header and footer part a section references, in reference order, then
+    the footnotes, endnotes and comments parts the main document relates to. Header and
+    footer parts no section references are never displayed and stay untouched.
+    Returns ``None`` when the named part, or the main document, is absent; a main
+    document that does not parse raises ``ET.ParseError``.
+    """
+    if part != ALL_STORIES:
+        return [part] if graph.has_part(part) else None
+    if not graph.has_part(_DOCUMENT):
+        return None
+    relationships = [rel for rel in graph.relationships_for(_DOCUMENT) if not rel.is_external]
+    by_id = {rel.id: rel for rel in relationships}
+    parts = [_DOCUMENT]
+
+    def add(rel: Any, kind: str) -> None:
+        if rel is None or rel.type.rsplit("/", 1)[-1] != kind:
+            return
+        target = rel.resolved_target()
+        if target not in parts and graph.has_part(target):
+            parts.append(target)
+
+    root = ET.fromstring(graph.read_part_bytes(_DOCUMENT))
+    ns = _word_namespace(root)
+    reference_kinds = {_q("headerReference", ns): "header", _q("footerReference", ns): "footer"}
+    for node in root.iter():
+        kind = reference_kinds.get(node.tag)
+        if kind is None:
+            continue
+        identifier = next(
+            (value for name, value in node.attrib.items() if name.endswith("}id")), None
+        )
+        add(by_id.get(identifier) if identifier is not None else None, kind)
+    for kind in _NOTE_STORY_KINDS:
+        for rel in relationships:
+            add(rel, kind)
+    return parts
 
 
 def _compile_pattern(pattern: str, options: FindReplaceOptions) -> re.Pattern[str] | None:
@@ -1036,41 +1144,47 @@ def discover_matches(
             "source_sha256": digest,
         }
 
-    if not graph.has_part(part):
+    invalid = {"passed": False, "code": "source_package_invalid", "source_sha256": digest}
+    try:
+        parts = _story_parts(graph, part)
+    except (ET.ParseError, KeyError):
+        return invalid
+    if parts is None:
         return {
             "passed": False,
             "code": "find_replace_part_unsupported",
             "source_sha256": digest,
         }
 
-    try:
-        root = ET.fromstring(graph.read_part_bytes(part))
-    except (ET.ParseError, KeyError):
-        return {
-            "passed": False,
-            "code": "source_package_invalid",
-            "source_sha256": digest,
-        }
-
-    ns = _word_namespace(root)
-    # Perform discovery on a deep clone without persisting
-    clone_root = copy.deepcopy(root)
-    matches, _ = _process_story_root(
-        clone_root,
-        compiled_pattern,
-        "",
-        opts,
-        ns,
-        part,
-        opts.max_replacements,
-        discovery=True,
-    )
+    budget = opts.max_replacements
+    matches: list[dict[str, Any]] = []
+    for name in parts:
+        remaining = None if budget is None else budget - len(matches)
+        if remaining == 0:
+            break
+        try:
+            root = ET.fromstring(graph.read_part_bytes(name))
+        except (ET.ParseError, KeyError):
+            return invalid
+        # Discovery never splices, so the freshly parsed tree is searched in place.
+        found, _ = _process_story_root(
+            root,
+            compiled_pattern,
+            "",
+            opts,
+            _word_namespace(root),
+            name,
+            remaining,
+            discovery=True,
+        )
+        matches.extend(found)
 
     return {
         "passed": True,
         "source_sha256": digest,
         "pattern": pattern,
         "part": part,
+        "parts": parts,
         "match_count": len(matches),
         "matches": matches,
     }
@@ -1087,10 +1201,15 @@ def find_replace(request: FindReplaceRequest, *, verify: str = "full") -> FindRe
     A pattern that replaces nothing refuses with ``find_replace_no_match`` and publishes
     nothing, matching ``Document.find_replace``.
 
-    Both verification modes require every staged part other than ``request.part``
-    (relationships included) to hash identically to the validated source.
+    ``request.part`` names one story part, or is :data:`ALL_STORIES` to search every
+    displayed story in one atomic publication; ``max_replacements`` then replaces the
+    earliest matches in document order (main document, referenced headers and
+    footers, footnotes, endnotes, comments).
+
+    Both verification modes require every staged part other than the edited story
+    parts (relationships included) to hash identically to the validated source.
     ``verify="full"`` (the default) additionally inspects the whole staged package;
-    ``verify="changed-parts"`` re-parses only ``request.part`` under the package
+    ``verify="changed-parts"`` re-parses only the edited parts under the package
     limits, relying on the source inspection for the byte-identical parts.
     """
     if not isinstance(request, FindReplaceRequest):
@@ -1133,22 +1252,43 @@ def find_replace(request: FindReplaceRequest, *, verify: str = "full") -> FindRe
     if not baseline.valid:
         return _refusal(current_hash, "source_package_invalid", destination)
 
-    if not graph.has_part(request.part):
-        return _refusal(current_hash, "find_replace_part_unsupported", destination)
-
     try:
-        part_bytes = graph.read_part_bytes(request.part)
-        root = parse_xml_with_preserved_qnames(part_bytes)
+        parts = _story_parts(graph, request.part)
     except (ET.ParseError, KeyError):
         return _refusal(current_hash, "source_package_invalid", destination)
+    if parts is None:
+        return _refusal(current_hash, "find_replace_part_unsupported", destination)
 
-    try:
-        matches, count, new_part_bytes = _replace_in_story(root, compiled_pattern, request)
-    except _FindReplaceValidationError as exc:
-        return _refusal(current_hash, str(exc), destination)
+    budget = request.options.max_replacements
+    matches: list[dict[str, Any]] = []
+    count = 0
+    replacements: dict[str, bytes] = {}
+    for name in parts:
+        remaining = None if budget is None else budget - count
+        if remaining == 0:
+            break
+        try:
+            root = parse_xml_with_preserved_qnames(graph.read_part_bytes(name))
+        except (ET.ParseError, KeyError):
+            return _refusal(current_hash, "source_package_invalid", destination)
+        try:
+            part_matches, part_count = _process_story_root(
+                root,
+                compiled_pattern,
+                request.replacement,
+                request.options,
+                _word_namespace(root),
+                name,
+                remaining,
+            )
+        except _FindReplaceValidationError as exc:
+            return _refusal(current_hash, str(exc), destination)
+        matches.extend(part_matches)
+        if part_count:
+            count += part_count
+            replacements[name] = serialize_xml_with_preserved_qnames(root)
     if not count:
         return _refusal(current_hash, "find_replace_no_match", destination)
-    replacements = {request.part: new_part_bytes}
 
     # Atomic stage and publish
     staged: Path | None = None
